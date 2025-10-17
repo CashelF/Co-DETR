@@ -260,6 +260,14 @@ class CoDINOHead(CoDeformDETRHead):
                                              dn_meta)
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          num_total_pos, num_total_neg) = cls_reg_targets
+        
+        pred_dtype = dn_bbox_preds.dtype
+        for i in range(len(bbox_targets_list)):
+            if bbox_targets_list[i].dtype != pred_dtype:
+                bbox_targets_list[i] = bbox_targets_list[i].to(pred_dtype)
+            if bbox_weights_list[i].dtype != pred_dtype:
+                bbox_weights_list[i] = bbox_weights_list[i].to(pred_dtype)
+
         labels = torch.cat(labels_list, 0)
         label_weights = torch.cat(label_weights_list, 0)
         bbox_targets = torch.cat(bbox_targets_list, 0)
@@ -277,21 +285,26 @@ class CoDINOHead(CoDeformDETRHead):
 
         if len(cls_scores) > 0:
             bg_class_ind = self.num_classes
-            pos_inds = ((labels >= 0)
-                        & (labels < bg_class_ind)).nonzero().squeeze(1)
-            scores = label_weights.new_zeros(labels.shape)
+            pos_inds = ((labels >= 0) & (labels < bg_class_ind)).nonzero().squeeze(1)
+
             pos_bbox_targets = bbox_targets[pos_inds]
             pos_decode_bbox_targets = bbox_cxcywh_to_xyxy(pos_bbox_targets)
             pos_bbox_pred = dn_bbox_preds.reshape(-1, 4)[pos_inds]
             pos_decode_bbox_pred = bbox_cxcywh_to_xyxy(pos_bbox_pred)
-            scores[pos_inds] = bbox_overlaps(
+
+            ov = bbox_overlaps(
                 pos_decode_bbox_pred.detach(),
                 pos_decode_bbox_targets,
                 is_aligned=True)
+
+            scores = ov.new_zeros(labels.shape)
+            scores[pos_inds] = ov
+
             loss_cls = self.loss_cls(
                 cls_scores, (labels, scores),
                 weight=label_weights,
                 avg_factor=cls_avg_factor)
+
         else:
             loss_cls = torch.zeros(  # TODO: How to better return zero loss
                 1,
@@ -380,6 +393,10 @@ class CoDINOHead(CoDeformDETRHead):
                                           img_h]).unsqueeze(0)
         gt_bboxes_normalized = gt_bboxes / factor
         gt_bboxes_targets = bbox_xyxy_to_cxcywh(gt_bboxes_normalized)
+
+        if gt_bboxes_targets.dtype != bbox_targets.dtype:
+            gt_bboxes_targets = gt_bboxes_targets.to(bbox_targets.dtype)
+
         bbox_targets[pos_inds] = gt_bboxes_targets.repeat([num_groups, 1])
 
         return (labels, label_weights, bbox_targets, bbox_weights, pos_inds,
@@ -515,11 +532,20 @@ class CoDINOHead(CoDeformDETRHead):
         num_imgs = cls_scores.size(0)
         cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
         bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
-        cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list,
+        with torch.cuda.amp.autocast(enabled=False):
+            cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list,
                                            gt_bboxes_list, gt_labels_list,
                                            img_metas, gt_bboxes_ignore_list)
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          num_total_pos, num_total_neg) = cls_reg_targets
+
+        pred_dtype = bbox_preds.dtype
+        for i in range(len(bbox_targets_list)):
+            if bbox_targets_list[i].dtype != pred_dtype:
+                bbox_targets_list[i] = bbox_targets_list[i].to(pred_dtype)
+            if bbox_weights_list[i].dtype != pred_dtype:
+                bbox_weights_list[i] = bbox_weights_list[i].to(pred_dtype)
+
         labels = torch.cat(labels_list, 0)
         label_weights = torch.cat(label_weights_list, 0)
         bbox_targets = torch.cat(bbox_targets_list, 0)
@@ -538,15 +564,19 @@ class CoDINOHead(CoDeformDETRHead):
         bg_class_ind = self.num_classes
         pos_inds = ((labels >= 0)
                     & (labels < bg_class_ind)).nonzero().squeeze(1)
-        scores = label_weights.new_zeros(labels.shape)
         pos_bbox_targets = bbox_targets[pos_inds]
         pos_decode_bbox_targets = bbox_cxcywh_to_xyxy(pos_bbox_targets)
         pos_bbox_pred = bbox_preds.reshape(-1, 4)[pos_inds]
         pos_decode_bbox_pred = bbox_cxcywh_to_xyxy(pos_bbox_pred)
-        scores[pos_inds] = bbox_overlaps(
+
+        ov = bbox_overlaps(
             pos_decode_bbox_pred.detach(),
             pos_decode_bbox_targets,
             is_aligned=True)
+
+        # scores must match ov.dtype to avoid index-assign dtype error
+        scores = ov.new_zeros(labels.shape)      # dtype = ov.dtype
+        scores[pos_inds] = ov
         loss_cls = self.loss_cls(
             cls_scores, (labels, scores),
             weight=label_weights,

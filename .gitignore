@@ -123,3 +123,9 @@ work_dirs/
 *.py~
 *.sh~
 
+work_dirs
+work_dir
+vitl_abes_ds
+vitl_cashel_ds
+wandb
+police_chase.mp4

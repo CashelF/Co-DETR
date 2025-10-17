@@ -510,7 +510,7 @@ class CoDeformDETRHead(DETRHead):
         losses = self.loss_aux(*loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
         return losses
 
-    @force_fp32(apply_to=('all_cls_scores_list', 'all_bbox_preds_list'))
+    @force_fp32(apply_to=('all_cls_scores', 'all_bbox_preds', 'enc_cls_scores', 'enc_bbox_preds'))
     def loss_aux(self,
                  all_cls_scores,
                  all_bbox_preds,
@@ -630,7 +630,7 @@ class CoDeformDETRHead(DETRHead):
         enc_outputs = outs[-1]
         return losses, enc_outputs
 
-    @force_fp32(apply_to=('all_cls_scores_list', 'all_bbox_preds_list'))
+    @force_fp32(apply_to=('all_cls_scores', 'all_bbox_preds', 'enc_cls_scores', 'enc_bbox_preds'))
     def loss(self,
              all_cls_scores,
              all_bbox_preds,
@@ -717,7 +717,7 @@ class CoDeformDETRHead(DETRHead):
             num_dec_layer += 1
         return loss_dict
 
-    @force_fp32(apply_to=('all_cls_scores_list', 'all_bbox_preds_list'))
+    @force_fp32(apply_to=('all_cls_scores', 'all_bbox_preds', 'enc_cls_scores', 'enc_bbox_preds'))
     def get_bboxes(self,
                    all_cls_scores,
                    all_bbox_preds,
@@ -953,9 +953,16 @@ class CoDeformDETRHead(DETRHead):
         ori_gt_bboxes_ignore = gt_bboxes_ignore
         gt_bboxes_ignore = None
         # assigner and sampler
-        assign_result = self.assigner.assign(bbox_pred, cls_score, gt_bboxes,
-                                            gt_labels, img_meta,
-                                            gt_bboxes_ignore)
+        with torch.cuda.amp.autocast(enabled=False):
+            assign_result = self.assigner.assign(
+                bbox_pred.float(),            # [N,4] fp32
+                cls_score.float(),            # [N,C] fp32
+                gt_bboxes.float(),            # [G,4] fp32
+                gt_labels, img_meta, gt_bboxes_ignore
+            )
+        # assign_result = self.assigner.assign(bbox_pred, cls_score, gt_bboxes,
+        #                                     gt_labels, img_meta,
+        #                                     gt_bboxes_ignore)
         sampling_result = self.sampler.sample(assign_result, bbox_pred,
                                               gt_bboxes)
         pos_inds = sampling_result.pos_inds
@@ -969,7 +976,9 @@ class CoDeformDETRHead(DETRHead):
         label_weights = gt_bboxes.new_ones(num_bboxes)
 
         # bbox targets
-        bbox_targets = torch.zeros_like(bbox_pred)
+        # bbox_targets = torch.zeros_like(bbox_pred)
+        bbox_targets = bbox_pred.new_zeros((num_bboxes, 4))
+
         bbox_weights = torch.zeros_like(bbox_pred)
         bbox_weights[pos_inds] = 1.0
         img_h, img_w, _ = img_meta['img_shape']
@@ -981,6 +990,8 @@ class CoDeformDETRHead(DETRHead):
                                        img_h]).unsqueeze(0)
         pos_gt_bboxes_normalized = sampling_result.pos_gt_bboxes / factor
         pos_gt_bboxes_targets = bbox_xyxy_to_cxcywh(pos_gt_bboxes_normalized)
+        if pos_gt_bboxes_targets.dtype != bbox_targets.dtype:
+            pos_gt_bboxes_targets = pos_gt_bboxes_targets.to(bbox_targets.dtype)
         bbox_targets[pos_inds] = pos_gt_bboxes_targets
 
         return (labels, label_weights, bbox_targets, bbox_weights, pos_inds,
