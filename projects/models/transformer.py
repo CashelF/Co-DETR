@@ -196,6 +196,9 @@ class CoDeformableDetrTransformer(DeformableDetrTransformer):
                 cls_branches=None,
                 return_encoder_output=False,
                 attn_masks=None,
+                prev_query_feats=None,
+                prev_reference_points=None,
+                prev_query_valid_lens=None,
                 **kwargs):
         """Forward function for `Transformer`.
 
@@ -330,6 +333,51 @@ class CoDeformableDetrTransformer(DeformableDetrTransformer):
             query = query.unsqueeze(0).expand(bs, -1, -1)
             reference_points = self.reference_points(query_pos).sigmoid()
             init_reference_out = reference_points
+
+        if prev_query_feats is not None and prev_reference_points is not None:
+            if prev_query_feats.size(0) != bs:
+                raise ValueError('prev_query_feats batch dimension mismatch with features.')
+            if prev_reference_points.size(0) != bs:
+                raise ValueError('prev_reference_points batch dimension mismatch with features.')
+            if prev_query_valid_lens is None:
+                prev_query_valid_lens = [prev_query_feats.size(1)] * bs
+            elif torch.is_tensor(prev_query_valid_lens):
+                prev_query_valid_lens = prev_query_valid_lens.tolist()
+            elif not isinstance(prev_query_valid_lens, (list, tuple)):
+                prev_query_valid_lens = [int(prev_query_valid_lens)] * bs
+            else:
+                prev_query_valid_lens = [int(v) for v in prev_query_valid_lens]
+
+            max_prev = prev_query_feats.size(1)
+            if max_prev > 0:
+                base_query_num = query.size(1)
+                total_query_num = base_query_num + max_prev
+                new_query = query.new_zeros(bs, total_query_num, c)
+                new_query[:, :base_query_num] = query
+                new_query_pos = query_pos.new_zeros(bs, total_query_num, c)
+                new_query_pos[:, :base_query_num] = query_pos
+                ref_dim = reference_points.size(-1)
+                new_reference = reference_points.new_zeros(bs, total_query_num, ref_dim)
+                new_reference[:, :base_query_num] = reference_points
+                for b in range(bs):
+                    valid_len = min(int(prev_query_valid_lens[b]), max_prev)
+                    if valid_len <= 0:
+                        continue
+                    new_query[b, base_query_num:base_query_num + valid_len] = prev_query_feats[b, :valid_len]
+                    new_query_pos[b, base_query_num:base_query_num + valid_len] = prev_query_feats[b, :valid_len]
+                    new_reference[b, base_query_num:base_query_num + valid_len] = prev_reference_points[b, :valid_len]
+                query = new_query
+                query_pos = new_query_pos
+                reference_points = new_reference
+                if attn_masks is not None:
+                    if attn_masks.dim() != 3:
+                        raise ValueError('attn_masks is expected to have 3 dimensions when using prev queries.')
+                    orig_q = attn_masks.size(-1)
+                    if orig_q != base_query_num:
+                        raise ValueError('attn_masks size does not match base query count.')
+                    expanded_masks = attn_masks.new_zeros(attn_masks.size(0), total_query_num, total_query_num)
+                    expanded_masks[:, :orig_q, :orig_q] = attn_masks
+                    attn_masks = expanded_masks
 
         # decoder
         query = query.permute(1, 0, 2)

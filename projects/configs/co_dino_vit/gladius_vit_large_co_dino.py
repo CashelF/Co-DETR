@@ -21,7 +21,7 @@ classes = (
 # -------------------------
 # 2) Paths (COCO-style)
 # -------------------------
-data_root = '/data/cashel-data/gladius-classification-coco/'
+data_root = '/data/cashel-data/gladius-classification-expanded/'
 train_anno = 'train/labels.json'
 val_anno   = 'val/labels.json'
 img_dir    = ''
@@ -203,7 +203,7 @@ custom_hooks = [
 # -------------------------
 WANDB_PROJECT = os.getenv('WANDB_PROJECT', 'co-detr-hydra')
 WANDB_ENTITY  = os.getenv('WANDB_ENTITY',  'cashel')
-WANDB_RUNNAME = os.getenv('WANDB_RUN_NAME', 'gladius_vitl_cashel_data')
+WANDB_RUNNAME = os.getenv('WANDB_RUN_NAME', 'gladius_vitl_abe_data_prev_decoder')
 
 log_config = dict(
     interval=50,
