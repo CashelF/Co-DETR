@@ -21,7 +21,7 @@ classes = (
 # -------------------------
 # 2) Paths (COCO-style)
 # -------------------------
-data_root = '/data/cashel-data/gladius-classification-coco/'
+data_root = '/data/cashel-data/abes-gladius-data-vid/'
 train_anno = 'train/labels.json'
 val_anno   = 'val/labels.json'
 img_dir    = ''
@@ -120,28 +120,31 @@ data = dict(
     samples_per_gpu=1,       # ViT-L is chunky. Start at 1; increase if you truly have VRAM.
     workers_per_gpu=4,
     train=dict(
-        type='CocoDataset',
+        type='CocoVideoDataset',
         ann_file=data_root + train_anno,
         img_prefix=data_root + 'train/' + img_dir,
         classes=classes,
+        load_as_video=True,
         filter_empty_gt=False,    # keep images with no boxes
         # if your base defines a custom train_pipeline, you can pull it in via {{_base_.train_pipeline}}
         # otherwise, leave it to the base file.
         # pipeline={{_base_.train_pipeline}},
     ),
     val=dict(
-        type='CocoDataset',
+        type='CocoVideoDataset',
         ann_file=data_root + val_anno,
         img_prefix=data_root + 'val/' + img_dir,
         classes=classes,
+        load_as_video=True,
         test_mode=True,
         # pipeline={{_base_.test_pipeline}},
     ),
     test=dict(
-        type='CocoDataset',
+        type='CocoVideoDataset',
         ann_file=data_root + val_anno,
         img_prefix=data_root + 'val/' + img_dir,
         classes=classes,
+        load_as_video=True,
         test_mode=True,
         # pipeline={{_base_.test_pipeline}},
     ),
@@ -174,6 +177,7 @@ load_from = 'checkpoints/co_dino_5scale_vit_large_coco.pth'
 # optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2))
 custom_imports = dict(
     imports=[
+          'mmdet.datasets.coco_video',
 #         'projects.hooks.patch_msda_hook',
 #         'projects.hooks.force_pt_msda_hook',
 #         'projects.hooks.freeze_backbone',
@@ -203,7 +207,7 @@ custom_hooks = [
 # -------------------------
 WANDB_PROJECT = os.getenv('WANDB_PROJECT', 'co-detr-hydra')
 WANDB_ENTITY  = os.getenv('WANDB_ENTITY',  'cashel')
-WANDB_RUNNAME = os.getenv('WANDB_RUN_NAME', 'gladius_vitl_cashel_data')
+WANDB_RUNNAME = os.getenv('WANDB_RUN_NAME', 'gladius_vitl_abes_gladius_data_vid')
 
 log_config = dict(
     interval=50,

@@ -14,7 +14,8 @@ from torch.utils.data import DataLoader
 
 from .samplers import (ClassAwareSampler, DistributedGroupSampler,
                        DistributedSampler, GroupSampler, InfiniteBatchSampler,
-                       InfiniteGroupBatchSampler)
+                       InfiniteGroupBatchSampler,
+                       DistributedSequentialVideoSampler, SequentialVideoSampler)
 
 if platform.system() != 'Windows':
     # https://github.com/pytorch/pytorch/issues/973
@@ -129,6 +130,15 @@ def build_dataloader(dataset,
     """
     rank, world_size = get_dist_info()
 
+    def is_video_dataset(_dataset):
+        if hasattr(_dataset, 'dataset'):
+            return is_video_dataset(_dataset.dataset)
+        if hasattr(_dataset, 'datasets') and len(_dataset.datasets) > 0:
+            return is_video_dataset(_dataset.datasets[0])
+        return getattr(_dataset, 'load_as_video', False)
+
+    video_dataset = is_video_dataset(dataset)
+
     if dist:
         # When model is :obj:`DistributedDataParallel`,
         # `batch_size` of :obj:`dataloader` is the
@@ -175,14 +185,26 @@ def build_dataloader(dataset,
             # DistributedGroupSampler will definitely shuffle the data to
             # satisfy that images on each GPU are in the same group
             if shuffle:
-                sampler = DistributedGroupSampler(
-                    dataset, samples_per_gpu, world_size, rank, seed=seed)
+                if video_dataset:
+                    sampler = DistributedSequentialVideoSampler(
+                        dataset,
+                        world_size,
+                        rank,
+                        shuffle_videos=True,
+                        seed=0 if seed is None else seed)
+                else:
+                    sampler = DistributedGroupSampler(
+                        dataset, samples_per_gpu, world_size, rank, seed=seed)
             else:
                 sampler = DistributedSampler(
                     dataset, world_size, rank, shuffle=False, seed=seed)
         else:
-            sampler = GroupSampler(dataset,
-                                   samples_per_gpu) if shuffle else None
+            if shuffle and video_dataset:
+                sampler = SequentialVideoSampler(
+                    dataset, shuffle_videos=True, seed=seed)
+            else:
+                sampler = GroupSampler(dataset,
+                                       samples_per_gpu) if shuffle else None
         batch_sampler = None
 
     init_fn = partial(
