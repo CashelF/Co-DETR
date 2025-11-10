@@ -255,7 +255,7 @@ class CoDeformDETRHead(DETRHead):
                 assert reference.shape[-1] == 2
                 tmp[..., :2] += reference
             outputs_coord = tmp.sigmoid()
-            output_class = output_class[..., :self.num_query, :]
+            outputs_class = outputs_class[..., :self.num_query, :]
             outputs_coord = outputs_coord[..., self.num_query, :]
             
             outputs_classes.append(outputs_class)
