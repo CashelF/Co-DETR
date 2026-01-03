@@ -69,8 +69,7 @@ class CocoVideoDataset(CocoDataset):
                 info['filename'] = info['file_name']
                 if 'video_name' not in info:
                     info['video_name'] = video_meta[vid_id].get('name', str(vid_id))
-                if 'is_video_first' not in info:
-                    info['is_video_first'] = int(frame['frame_id']) == 0
+                info['is_video_first'] = (frame is frames[0])
                 data_infos.append(info)
                 self.img_ids.append(frame['id'])
 

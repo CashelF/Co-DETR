@@ -378,7 +378,7 @@ class CoDeformableDetrTransformer(DeformableDetrTransformer):
                         continue
                     new_query[b, base_query_num:base_query_num + valid_len] = prev_query_feats[b, :valid_len]
 
-                    prev_unact = inverse_sigmoid(prev_reference_points[b, :valid_len])
+                    prev_unact = inverse_sigmoid(prev_reference_points[b, :valid_len]).unsqueeze(0)
                     prev_pos = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(prev_unact)))
                     prev_pos, _content_ignored = torch.split(prev_pos, c, dim=2)
                     new_query_pos[b, base_query_num:base_query_num + valid_len] = prev_pos.squeeze(0) if prev_pos.dim()==3 else prev_pos

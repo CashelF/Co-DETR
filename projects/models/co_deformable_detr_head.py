@@ -256,7 +256,7 @@ class CoDeformDETRHead(DETRHead):
                 tmp[..., :2] += reference
             outputs_coord = tmp.sigmoid()
             outputs_class = outputs_class[..., :self.num_query, :]
-            outputs_coord = outputs_coord[..., self.num_query, :]
+            outputs_coord = outputs_coord[..., :self.num_query, :]
             
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
