@@ -22,6 +22,17 @@ from mmdet.utils import (collect_env, get_device, get_root_logger,
                          update_data_root)
 from projects import *
 
+import signal, sys, wandb
+
+def _sigint(_sig, _frm):
+    try:
+        wandb.finish(exit_code=130)
+    finally:
+        sys.exit(130)
+
+signal.signal(signal.SIGINT, _sigint)
+
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a detector')
