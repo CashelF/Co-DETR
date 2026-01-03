@@ -393,17 +393,44 @@ class CoDETR(BaseDetector):
             for det_bboxes, det_labels in results_list
         ]
         if decoder_cache is not None:
+            if not isinstance(decoder_cache, dict):
+                if isinstance(decoder_cache, (list, tuple)) and len(decoder_cache) >= 3:
+                    # Some code paths may still emit the cache as a positional
+                    # tuple/list (query_feats, reference_points, valid_lengths).
+                    # Normalize it into the dict form expected below.
+                    decoder_cache = {
+                        'query_feats': decoder_cache[0],
+                        'reference_points': decoder_cache[1],
+                        'valid_lengths': decoder_cache[2]
+                    }
+                else:
+                    decoder_cache = None
+        if decoder_cache is not None:
             query_feats = decoder_cache.get('query_feats')
             reference_points = decoder_cache.get('reference_points')
             valid_lengths = decoder_cache.get('valid_lengths')
             if torch.is_tensor(valid_lengths):
                 valid_lengths = valid_lengths.tolist()
+
+            def _normalize_length(value):
+                if value is None:
+                    return 0
+                # Unwrap nested containers that may arise from
+                # data pipeline conversions (e.g. JSON -> list).
+                while isinstance(value, (list, tuple)):
+                    if not value:
+                        return 0
+                    value = value[0]
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return 0
             for idx, img_meta in enumerate(img_metas):
                 length = 0
                 if query_feats is not None:
                     length = query_feats.shape[1]
                 if valid_lengths is not None and len(valid_lengths) > idx:
-                    length = min(length, int(valid_lengths[idx]))
+                    length = min(length, _normalize_length(valid_lengths[idx]))
                 if query_feats is not None and length > 0:
                     img_meta['prev_query_feats'] = query_feats[idx, :length].detach().cpu()
                 else:

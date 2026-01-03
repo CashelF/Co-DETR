@@ -43,6 +43,10 @@ class CoDeformDETRHead(DETRHead):
             transformer['mixed_selection'] = self.mixed_selection
         super(CoDeformDETRHead, self).__init__(
             *args, transformer=transformer, **kwargs)
+        # persistent storage that keeps the latest decoder outputs per sequence
+        # so that sequential samples encountered during training can recover
+        # the previous frame queries even when the dataloader shuffles clips.
+        self._prev_decoder_cache = {}
 
 
     def _init_layers(self):
@@ -150,9 +154,22 @@ class CoDeformDETRHead(DETRHead):
         has_prev_queries = False
         for img_id in range(batch_size):
             meta = img_metas[img_id]
+            seq_key = self._get_sequence_key(meta)
             prev_feats = meta.get('prev_query_feats', None)
             prev_refs = meta.get('prev_reference_points', None)
             prev_len = meta.get('prev_query_valid_length', None)
+            if prev_feats is None and seq_key is not None:
+                cached = self._prev_decoder_cache.get(seq_key, None)
+                if cached is not None:
+                    prev_feats = cached.get('query_feats')
+                    prev_refs = cached.get('reference_points')
+                    prev_len = cached.get('valid_length')
+            if self._should_reset_sequence(meta):
+                prev_feats = None
+                prev_refs = None
+                prev_len = 0
+                if seq_key is not None:
+                    self._prev_decoder_cache.pop(seq_key, None)
             if prev_feats is None or prev_refs is None:
                 prev_query_feats_list.append(None)
                 prev_reference_points_list.append(None)
@@ -238,6 +255,9 @@ class CoDeformDETRHead(DETRHead):
                 assert reference.shape[-1] == 2
                 tmp[..., :2] += reference
             outputs_coord = tmp.sigmoid()
+            outputs_class = outputs_class[..., :self.num_query, :]
+            outputs_coord = outputs_coord[..., self.num_query, :]
+            
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
 
@@ -250,6 +270,7 @@ class CoDeformDETRHead(DETRHead):
             'reference_points': outputs_coords[-1, :, :cache_length].detach(),
             'valid_lengths': hs.new_full((batch_size,), cache_length, dtype=torch.long)
         }
+        self._update_sequence_cache(img_metas, decoder_cache)
 
         if self.as_two_stage:
             return outputs_classes, outputs_coords, \
@@ -258,6 +279,79 @@ class CoDeformDETRHead(DETRHead):
         else:
             return outputs_classes, outputs_coords, \
                 None, None, outs, decoder_cache
+
+    def _get_sequence_key(self, meta):
+        if meta is None:
+            return None
+        if 'prev_query_key' in meta:
+            return meta['prev_query_key']
+        for key in ('video_id', 'seq_id', 'sequence_id', 'clip_id',
+                    'video_name', 'scene_id'):
+            if key in meta:
+                return (key, meta[key])
+        if 'ori_filename' in meta:
+            return ('ori_filename', meta['ori_filename'])
+        if 'img_id' in meta:
+            return ('img_id', meta['img_id'])
+        return None
+
+    def _should_reset_sequence(self, meta):
+        if meta is None:
+            return False
+        if meta.get('is_video_first', False):
+            return True
+        if meta.get('is_first', False):
+            return True
+        frame_keys = ('frame_id', 'frame_ind', 'frame_idx', 'frame_num')
+        for key in frame_keys:
+            if key in meta:
+                try:
+                    if int(meta[key]) == 0:
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    def _update_sequence_cache(self, img_metas, decoder_cache):
+        if decoder_cache is None:
+            return
+        query_feats = decoder_cache.get('query_feats')
+        reference_points = decoder_cache.get('reference_points')
+        valid_lengths = decoder_cache.get('valid_lengths')
+        if query_feats is None or reference_points is None:
+            return
+        if torch.is_tensor(valid_lengths):
+            valid_lengths = valid_lengths.tolist()
+
+        def _normalize_length(value):
+            if value is None:
+                return 0
+            while isinstance(value, (list, tuple)):
+                if not value:
+                    return 0
+                value = value[0]
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+        for idx, meta in enumerate(img_metas):
+            seq_key = self._get_sequence_key(meta)
+            if seq_key is None:
+                continue
+            length = query_feats.size(1)
+            if valid_lengths is not None and len(valid_lengths) > idx:
+                length = min(length, _normalize_length(valid_lengths[idx]))
+            if length <= 0:
+                self._prev_decoder_cache.pop(seq_key, None)
+                continue
+            if self._should_reset_sequence(meta):
+                # already cleared above but keep only the new cache
+                pass
+            self._prev_decoder_cache[seq_key] = {
+                'query_feats': query_feats[idx, :length].detach().cpu(),
+                'reference_points': reference_points[idx, :length].detach().cpu(),
+                'valid_length': length
+            }
 
     def forward_aux(self, mlvl_feats, img_metas, aux_targets, head_idx):
         """Forward function.
