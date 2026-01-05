@@ -196,9 +196,10 @@ class CoDeformableDetrTransformer(DeformableDetrTransformer):
                 cls_branches=None,
                 return_encoder_output=False,
                 attn_masks=None,
-                prev_query_feats=None,
-                prev_reference_points=None,
+                prev_query_feats_list=None,
+                prev_reference_points_list=None,
                 prev_query_valid_lens=None,
+                return_decoder_cache=False,
                 **kwargs):
         """Forward function for `Transformer`.
 
@@ -334,69 +335,26 @@ class CoDeformableDetrTransformer(DeformableDetrTransformer):
             reference_points = self.reference_points(query_pos).sigmoid()
             init_reference_out = reference_points
 
+        prev_query_feats, prev_reference_points, prev_query_valid_lens = (
+            self._prepare_prev_queries(
+                prev_query_feats_list,
+                prev_reference_points_list,
+                prev_query_valid_lens,
+                bs,
+                device=feat_flatten.device,
+                dtype=feat_flatten.dtype))
+        base_query_num = query.size(1)
+        dn_query_num = 0
+        detection_query_num = base_query_num
         if prev_query_feats is not None and prev_reference_points is not None:
-            if prev_query_feats.size(0) != bs:
-                raise ValueError('prev_query_feats batch dimension mismatch with features.')
-            if prev_reference_points.size(0) != bs:
-                raise ValueError('prev_reference_points batch dimension mismatch with features.')
-            if prev_query_valid_lens is None:
-                prev_query_valid_lens = [prev_query_feats.size(1)] * bs
-            elif torch.is_tensor(prev_query_valid_lens):
-                prev_query_valid_lens = prev_query_valid_lens.tolist()
-
-            def _normalize_length(value):
-                if value is None:
-                    return prev_query_feats.size(1)
-                while isinstance(value, (list, tuple)):
-                    if not value:
-                        return 0
-                    value = value[0]
-                try:
-                    return int(value)
-                except (TypeError, ValueError):
-                    return prev_query_feats.size(1)
-
-            if not isinstance(prev_query_valid_lens, (list, tuple)):
-                prev_query_valid_lens = [_normalize_length(prev_query_valid_lens)] * bs
-            else:
-                prev_query_valid_lens = [_normalize_length(v) for v in prev_query_valid_lens]
-
-            max_prev = prev_query_feats.size(1)
-            if max_prev > 0:
-                base_query_num = query.size(1)
-                total_query_num = base_query_num + max_prev
-                new_query = query.new_zeros(bs, total_query_num, c)
-                new_query[:, :base_query_num] = query
-                new_query_pos = query_pos.new_zeros(bs, total_query_num, c)
-                new_query_pos[:, :base_query_num] = query_pos
-                ref_dim = reference_points.size(-1)
-                new_reference = reference_points.new_zeros(bs, total_query_num, ref_dim)
-                new_reference[:, :base_query_num] = reference_points
-                for b in range(bs):
-                    valid_len = min(int(prev_query_valid_lens[b]), max_prev)
-                    if valid_len <= 0:
-                        continue
-                    new_query[b, base_query_num:base_query_num + valid_len] = prev_query_feats[b, :valid_len]
-
-                    prev_unact = inverse_sigmoid(prev_reference_points[b, :valid_len]).unsqueeze(0)
-                    prev_pos = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(prev_unact)))
-                    prev_pos, _content_ignored = torch.split(prev_pos, c, dim=2)
-                    new_query_pos[b, base_query_num:base_query_num + valid_len] = prev_pos.squeeze(0) if prev_pos.dim()==3 else prev_pos
-
-                    # new_query_pos[b, base_query_num:base_query_num + valid_len] = prev_query_feats[b, :valid_len]
-                    new_reference[b, base_query_num:base_query_num + valid_len] = prev_reference_points[b, :valid_len]
-                query = new_query
-                query_pos = new_query_pos
-                reference_points = new_reference
-                if attn_masks is not None:
-                    if attn_masks.dim() != 3:
-                        raise ValueError('attn_masks is expected to have 3 dimensions when using prev queries.')
-                    orig_q = attn_masks.size(-1)
-                    if orig_q != base_query_num:
-                        raise ValueError('attn_masks size does not match base query count.')
-                    expanded_masks = attn_masks.new_zeros(attn_masks.size(0), total_query_num, total_query_num)
-                    expanded_masks[:, :orig_q, :orig_q] = attn_masks
-                    attn_masks = expanded_masks
+            query, query_pos, reference_points, attn_masks = self._append_prev_queries(
+                query,
+                query_pos,
+                reference_points,
+                prev_query_feats,
+                prev_reference_points,
+                prev_query_valid_lens,
+                attn_masks=attn_masks)
 
         # decoder
         query = query.permute(1, 0, 2)
@@ -417,19 +375,225 @@ class CoDeformableDetrTransformer(DeformableDetrTransformer):
             **kwargs)
 
         inter_references_out = inter_references
+        decoder_cache = None
+        if return_decoder_cache:
+            decoder_cache = self._build_decoder_cache(
+                inter_states,
+                inter_references_out,
+                detection_query_num,
+                dn_query_num)
         if self.as_two_stage:
             if return_encoder_output:
                 return inter_states, init_reference_out,\
                     inter_references_out, enc_outputs_class,\
-                    enc_outputs_coord_unact, memory                
+                    enc_outputs_coord_unact, memory, decoder_cache
             return inter_states, init_reference_out,\
                 inter_references_out, enc_outputs_class,\
-                enc_outputs_coord_unact
+                enc_outputs_coord_unact, decoder_cache
         if return_encoder_output:
             return inter_states, init_reference_out, \
-                inter_references_out, None, None, memory
+                inter_references_out, None, None, memory, decoder_cache
         return inter_states, init_reference_out, \
-            inter_references_out, None, None
+            inter_references_out, None, None, decoder_cache
+
+    def _prepare_prev_queries(self,
+                              prev_query_feats_list,
+                              prev_reference_points_list,
+                              prev_query_valid_lens,
+                              batch_size,
+                              device,
+                              dtype):
+        if prev_query_feats_list is None or prev_reference_points_list is None:
+            return None, None, None
+        if not isinstance(prev_query_feats_list, (list, tuple)) or not isinstance(prev_reference_points_list, (list, tuple)):
+            raise ValueError('prev_query_feats_list and prev_reference_points_list must be lists when provided.')
+        if len(prev_query_feats_list) != batch_size or len(prev_reference_points_list) != batch_size:
+            raise ValueError('prev query lists must have length equal to batch size.')
+
+        if prev_query_valid_lens is None:
+            prev_query_valid_lens = [None for _ in range(batch_size)]
+        elif torch.is_tensor(prev_query_valid_lens):
+            prev_query_valid_lens = prev_query_valid_lens.tolist()
+        elif not isinstance(prev_query_valid_lens, (list, tuple)):
+            prev_query_valid_lens = [prev_query_valid_lens for _ in range(batch_size)]
+
+        ref_dim = None
+        max_prev = 0
+        valid_lengths = []
+        normalized_feats = []
+        normalized_refs = []
+        def _normalize_length(value, default_len):
+            if value is None:
+                return default_len
+            while isinstance(value, (list, tuple)):
+                if not value:
+                    return 0
+                value = value[0]
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default_len
+        for feats, refs, length in zip(prev_query_feats_list, prev_reference_points_list, prev_query_valid_lens):
+            if feats is None or refs is None:
+                normalized_feats.append(None)
+                normalized_refs.append(None)
+                valid_lengths.append(0)
+                continue
+            feats = torch.as_tensor(feats, device=device, dtype=dtype)
+            refs = torch.as_tensor(refs, device=device, dtype=dtype)
+            if feats.dim() != 2 or feats.size(-1) != self.embed_dims:
+                raise ValueError('prev_query_feats must have shape [num, embed_dims].')
+            if refs.dim() != 2:
+                raise ValueError('prev_reference_points must have shape [num, ref_dim].')
+            if ref_dim is None:
+                ref_dim = refs.size(-1)
+            valid_len = _normalize_length(length, feats.size(0))
+            valid_len = min(valid_len, feats.size(0), refs.size(0)) if feats.numel() > 0 else 0
+            max_prev = max(max_prev, valid_len)
+            normalized_feats.append(feats)
+            normalized_refs.append(refs)
+            valid_lengths.append(valid_len)
+
+        if max_prev <= 0:
+            return None, None, valid_lengths
+
+        if ref_dim is None:
+            ref_dim = 4
+        prev_query_feats = torch.zeros((batch_size, max_prev, self.embed_dims), device=device, dtype=dtype)
+        prev_reference_points = torch.zeros((batch_size, max_prev, ref_dim), device=device, dtype=dtype)
+        for idx in range(batch_size):
+            valid_len = valid_lengths[idx]
+            if valid_len <= 0:
+                continue
+            prev_query_feats[idx, :valid_len] = normalized_feats[idx][:valid_len]
+            prev_reference_points[idx, :valid_len] = normalized_refs[idx][:valid_len]
+        return prev_query_feats, prev_reference_points, valid_lengths
+
+    def _append_prev_queries(self,
+                             query,
+                             query_pos,
+                             reference_points,
+                             prev_query_feats,
+                             prev_reference_points,
+                             prev_query_valid_lens,
+                             attn_masks=None):
+        bs, base_query_num, c = query.shape
+        if query_pos is None:
+            query_pos = query.new_zeros(bs, base_query_num, c)
+        max_prev = prev_query_feats.size(1)
+        total_query_num = base_query_num + max_prev
+        new_query = query.new_zeros(bs, total_query_num, c)
+        new_query[:, :base_query_num] = query
+        new_query_pos = query_pos.new_zeros(bs, total_query_num, c)
+        new_query_pos[:, :base_query_num] = query_pos
+        ref_dim = reference_points.size(-1)
+        new_reference = reference_points.new_zeros(bs, total_query_num, ref_dim)
+        new_reference[:, :base_query_num] = reference_points
+        new_reference[:, :base_query_num] = reference_points
+
+        # Vectorized processing of previous queries
+        # 1. Inverse Sigmoid
+        prev_unact = inverse_sigmoid(prev_reference_points)
+        
+        # 2. Positional Embedding
+        prev_pos_embed = self.get_proposal_pos_embed(prev_unact)
+        
+        # 3. Projection
+        prev_pos_trans = self.pos_trans(prev_pos_embed)
+        prev_pos_trans = self.pos_trans_norm(prev_pos_trans)
+        
+        # 4. Split
+        prev_pos_all, _ = torch.split(prev_pos_trans, c, dim=2)
+
+        for b in range(bs):
+            valid_len = min(int(prev_query_valid_lens[b]), max_prev)
+            if valid_len <= 0:
+                continue
+            new_query[b, base_query_num:base_query_num + valid_len] = prev_query_feats[b, :valid_len]
+            
+            # Use pre-computed positions
+            new_query_pos[b, base_query_num:base_query_num + valid_len] = prev_pos_all[b, :valid_len]
+            new_reference[b, base_query_num:base_query_num + valid_len] = prev_reference_points[b, :valid_len]
+        if attn_masks is not None:
+            if attn_masks.dim() == 2:
+                attn_masks = attn_masks.unsqueeze(0).repeat(bs, 1, 1)
+
+            if attn_masks.dim() != 3:
+                raise ValueError('attn_masks is expected to have 3 dimensions when using prev queries.')
+            orig_q = attn_masks.size(-1)
+            # expand attn_masks
+            new_attn_masks = attn_masks.new_zeros(bs, total_query_num, total_query_num).bool() # Ensure boolean
+            # Usually strict masking is safer (True=masked). Co-DETR/DN-DETR uses boolean masks mostly.
+            
+            new_attn_masks[:, :orig_q, :orig_q] = attn_masks
+            
+            for b_idx in range(bs):
+                valid_l = min(int(prev_query_valid_lens[b_idx]), max_prev)
+                
+                # Mask out invalid (padding) previous queries
+                if valid_l < max_prev:
+                    # Invalid prev queries cannot see anything (or be seen)
+                    # Although strictly, they are just padding, so it doesn't matter much if they attend to things,
+                    # but they SHOULD NOT be attended to.
+                    new_attn_masks[b_idx, :, base_query_num + valid_l:] = True
+                    new_attn_masks[b_idx, base_query_num + valid_l:, :] = True
+                
+                # Copy DN masking pattern for Valid Previous Queries
+                # We assume the last "normal" query (last col of orig mask) represents the desired visibility
+                # for normal detection queries (which previous queries are).
+                # This ensures previous queries cannot see DN queries (if normal queries can't).
+                if base_query_num > 0:
+                    example_row_mask = attn_masks[b_idx, -1, :base_query_num]
+                    # Broadcast to new rows
+                    new_attn_masks[b_idx, base_query_num : base_query_num + valid_l, :base_query_num] = example_row_mask
+
+            # PyTorch MultiheadAttention expects (bs * num_heads, L, S) for 3D masks.
+            # We need to repeat the mask for each head.
+            # Try to get num_heads from decoder
+            num_heads = 8 # Default fallback
+            if hasattr(self, 'decoder') and hasattr(self.decoder, 'layers') and len(self.decoder.layers) > 0:
+                 # Check attentions list
+                 if hasattr(self.decoder.layers[0], 'attentions'):
+                     for attn in self.decoder.layers[0].attentions:
+                         if hasattr(attn, 'num_heads'):
+                             num_heads = attn.num_heads
+                             break
+            
+            new_attn_masks = new_attn_masks.repeat_interleave(num_heads, dim=0)
+
+            return new_query, new_query_pos, new_reference, new_attn_masks
+        return new_query, new_query_pos, new_reference, attn_masks
+
+    def _build_decoder_cache(self,
+                             inter_states,
+                             inter_references,
+                             detection_query_num,
+                             dn_query_num):
+
+        if inter_states is None or inter_references is None:
+
+            return None
+        last_hs = inter_states[-1].transpose(0, 1)
+        last_refs = inter_references[-1]
+        if last_refs.dim() == 4:
+            last_refs = last_refs[-1]
+        detection_start = dn_query_num if dn_query_num is not None else 0
+        detection_length = detection_query_num if detection_query_num is not None else last_hs.size(1) - detection_start
+        detection_length = max(0, min(detection_length, last_hs.size(1) - detection_start))
+
+
+
+        cache_feats = last_hs[:, detection_start:detection_start + detection_length]
+        cache_refs = last_refs[:, detection_start:detection_start + detection_length]
+        
+
+        
+        cache_length = cache_feats.size(1)
+        return {
+            'query_feats': cache_feats.detach(),
+            'reference_points': cache_refs.detach(),
+            'valid_lengths': last_hs.new_full((last_hs.size(0),), cache_length, dtype=torch.long)
+        }
 
     def forward_aux(self,
                     mlvl_feats,
@@ -654,6 +818,9 @@ class CoDinoTransformer(CoDeformableDetrTransformer):
                         self.pos_feats_trans.append(nn.Linear(self.embed_dims, self.embed_dims))
                         self.pos_feats_norm.append(nn.LayerNorm(self.embed_dims))
 
+        self.pos_trans = nn.Linear(self.embed_dims * 2, self.embed_dims * 2)
+        self.pos_trans_norm = nn.LayerNorm(self.embed_dims * 2)
+
     def init_weights(self):
         super().init_weights()
         nn.init.normal_(self.query_embed.weight.data)
@@ -666,11 +833,24 @@ class CoDinoTransformer(CoDeformableDetrTransformer):
                 dn_label_query,
                 dn_bbox_query,
                 attn_mask,
+                prev_query_feats_list=None,
+                prev_reference_points_list=None,
+                prev_query_valid_lens=None,
+                return_decoder_cache=False,
                 reg_branches=None,
                 cls_branches=None,
                 **kwargs):
         assert self.as_two_stage and query_embed is None, \
             'as_two_stage must be True for DINO'
+        
+        # Dummy usage of pos_trans to avoid DDP errors (unused parameters in first iteration)
+        # This replaces find_unused_parameters=True which conflicts with checkpointing
+        if hasattr(self, 'pos_trans'):
+            dummy = mlvl_feats[0].new_zeros(1, 1, self.embed_dims * 2)
+            d_out = self.pos_trans_norm(self.pos_trans(dummy))
+            kwargs['dummy_loss'] = d_out.sum() * 0
+
+
 
         feat_flatten = []
         mask_flatten = []
@@ -718,6 +898,16 @@ class CoDinoTransformer(CoDeformableDetrTransformer):
         memory = memory.permute(1, 0, 2)
         bs, _, c = memory.shape
 
+
+        prev_query_feats, prev_reference_points, prev_query_valid_lens = (
+            self._prepare_prev_queries(
+                prev_query_feats_list,
+                prev_reference_points_list,
+                prev_query_valid_lens,
+                bs,
+                device=feat_flatten.device,
+                dtype=feat_flatten.dtype))
+
         output_memory, output_proposals = self.gen_encoder_output_proposals(
             memory, mask_flatten, spatial_shapes)
         enc_outputs_class = cls_branches[self.decoder.num_layers](
@@ -743,6 +933,8 @@ class CoDinoTransformer(CoDeformableDetrTransformer):
         # NOTE the query_embed here is not spatial query as in DETR.
         # It is actually content query, which is named tgt in other
         # DETR-like models
+        detection_query_num = query.size(1)
+        dn_query_num = dn_label_query.size(1) if dn_label_query is not None else 0
         if dn_label_query is not None:
             query = torch.cat([dn_label_query, query], dim=1)
         if dn_bbox_query is not None:
@@ -751,6 +943,17 @@ class CoDinoTransformer(CoDeformableDetrTransformer):
         else:
             reference_points = topk_coords_unact
         reference_points = reference_points.sigmoid()
+
+        if prev_query_feats is not None and prev_reference_points is not None:
+            query_pos = query.new_zeros(bs, query.size(1), c)
+            query, query_pos, reference_points, attn_mask = self._append_prev_queries(
+                query,
+                query_pos,
+                reference_points,
+                prev_query_feats,
+                prev_reference_points,
+                prev_query_valid_lens,
+                attn_masks=attn_mask)
         # decoder
         query = query.permute(1, 0, 2)
         memory = memory.permute(1, 0, 2)
@@ -768,8 +971,15 @@ class CoDinoTransformer(CoDeformableDetrTransformer):
             **kwargs)
 
         inter_references_out = inter_references
+        decoder_cache = None
+        if return_decoder_cache:
+            decoder_cache = self._build_decoder_cache(
+                inter_states,
+                inter_references_out,
+                detection_query_num,
+                dn_query_num)
 
-        return inter_states, inter_references_out, topk_score, topk_anchor, memory
+        return inter_states, inter_references_out, topk_score, topk_anchor, memory, decoder_cache
 
 
     def forward_aux(self,

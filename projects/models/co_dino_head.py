@@ -71,14 +71,15 @@ class CoDINOHead(CoDeformDETRHead):
             self.dn_generator(gt_bboxes, gt_labels,
                               self.label_embedding, img_metas)
         outs = self(x, img_metas, dn_label_query, dn_bbox_query, attn_mask)
+        head_outputs = outs[:5]
         if gt_labels is None:
-            loss_inputs = outs + (gt_bboxes, img_metas, dn_meta)
+            loss_inputs = head_outputs + (gt_bboxes, img_metas, dn_meta)
         else:
-            loss_inputs = outs + (gt_bboxes, gt_labels, img_metas, dn_meta)
+            loss_inputs = head_outputs + (gt_bboxes, gt_labels, img_metas, dn_meta)
         losses = self.loss(*loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
-        enc_outputs = outs[-1]
+        enc_outputs = head_outputs[-1]
         with torch.no_grad():
-            tmp_results_list = self.get_bboxes(*outs, img_metas=img_metas, rescale=False, with_nms=False)
+            tmp_results_list = self.get_bboxes(*head_outputs, img_metas=img_metas, rescale=False, with_nms=False)
             results_list = [res[0] for res in tmp_results_list]
         return losses, enc_outputs, results_list
 
@@ -106,7 +107,10 @@ class CoDINOHead(CoDeformDETRHead):
                 self.positional_encoding(mlvl_masks[-1]))
 
         query_embeds = None
-        hs, inter_references, topk_score, topk_anchor, enc_outputs = \
+        prev_query_feats_list, prev_reference_points_list, prev_valid_lengths = (
+            self._collect_prev_queries(img_metas))
+
+        hs, inter_references, topk_score, topk_anchor, enc_outputs, decoder_cache = \
             self.transformer(
                 mlvl_feats,
                 mlvl_masks,
@@ -115,6 +119,10 @@ class CoDINOHead(CoDeformDETRHead):
                 dn_label_query,
                 dn_bbox_query,
                 attn_mask,
+                prev_query_feats_list=prev_query_feats_list,
+                prev_reference_points_list=prev_reference_points_list,
+                prev_query_valid_lens=prev_valid_lengths,
+                return_decoder_cache=True,
                 reg_branches=self.reg_branches if self.with_box_refine else None,  # noqa:E501
                 cls_branches=self.cls_branches if self.as_two_stage else None  # noqa:E501
             )
@@ -156,8 +164,9 @@ class CoDINOHead(CoDeformDETRHead):
 
         outputs_classes = torch.stack(outputs_classes)
         outputs_coords = torch.stack(outputs_coords)
+        self._update_sequence_cache(img_metas, decoder_cache)
 
-        return outputs_classes, outputs_coords, topk_score, topk_anchor, outs
+        return outputs_classes, outputs_coords, topk_score, topk_anchor, outs, decoder_cache
 
     def loss(self,
              all_cls_scores,
