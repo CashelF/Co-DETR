@@ -533,10 +533,19 @@ class CoDeformableDetrTransformer(DeformableDetrTransformer):
                 # Mask out invalid (padding) previous queries
                 if valid_l < max_prev:
                     # Invalid prev queries cannot see anything (or be seen)
-                    # Although strictly, they are just padding, so it doesn't matter much if they attend to things,
-                    # but they SHOULD NOT be attended to.
+                    # BUT if we mask EVERYTHING, Softmax calculation becomes NaN (all -inf).
+                    # So we MUST allow them to see THEMSELVES (diagonal).
+                    
+                    # 1. Mask columns (others can't see them) -> Safe
                     new_attn_masks[b_idx, :, base_query_num + valid_l:] = True
+                    
+                    # 2. Mask rows (they can't see others) -> Safe
                     new_attn_masks[b_idx, base_query_num + valid_l:, :] = True
+                    
+                    # 3. Unmask diagonal for these invalid queries so they have at least one valid target (themselves)
+                    # This prevents NaN in Softmax.
+                    invalid_indices = torch.arange(base_query_num + valid_l, total_query_num, device=new_attn_masks.device)
+                    new_attn_masks[b_idx, invalid_indices, invalid_indices] = False
                 
                 # Copy DN masking pattern for Valid Previous Queries
                 # We assume the last "normal" query (last col of orig mask) represents the desired visibility
