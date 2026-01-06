@@ -117,7 +117,7 @@ model = dict(
 #    - point prefixes correctly
 # -------------------------
 data = dict(
-    samples_per_gpu=1,       # ViT-L is chunky. Start at 1; increase if you truly have VRAM.
+    samples_per_gpu=2,       # ViT-L is chunky. Start at 1; increase if you truly have VRAM.
     workers_per_gpu=4,
     train=dict(
         type='CocoVideoDataset',
@@ -162,52 +162,124 @@ load_from = 'checkpoints/co_dino_5scale_vit_large_coco.pth'
 #    If your *effective* total batch < base, scale lr proportionally.
 # -------------------------
 # Example override if you need it (commented; base likely already sets this):
-# optimizer = dict(
-#     type='AdamW',
-#     lr=5e-5,
-#     weight_decay=0.01,
-#     constructor='LayerDecayOptimizerConstructor',
-#     paramwise_cfg=dict(num_layers=24, layer_decay_rate=0.8),
-# )
+optimizer = dict(
+    type='AdamW',
+    lr=1e-5,
+    weight_decay=0.01,
+    constructor='LayerDecayOptimizerConstructor',
+    paramwise_cfg=dict(num_layers=24, layer_decay_rate=0.8),
+)
 # optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2))
 # lr_config = dict(policy='step', warmup='linear', warmup_iters=500, warmup_ratio=0.01, step=[7])
 # runner = dict(type='EpochBasedRunner', max_epochs=12)
 # --- Mixed precision (AMP) ---
 # fp16 = dict(loss_scale='dynamic')
 # optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2))
-custom_imports = dict(
-    imports=[
-          'mmdet.datasets.coco_video',
-#         'projects.hooks.patch_msda_hook',
-#         'projects.hooks.force_pt_msda_hook',
-#         'projects.hooks.freeze_backbone',
-        #   'projects.optim.oss_adamw',
-    ],
-    allow_failed_imports=False,
-)
-
-custom_hooks = [
-#     dict(type='PatchMSDAHook'),
-#     dict(type='ForcePTMSDAHook'),
-    #   dict(type='FreezeBackboneHook', module_names=['backbone']),
-]
-
-# optimizer = dict(
-#     type='OSSAdamW',   
-#     lr=5e-5,
-#     weight_decay=0.01,
-#     constructor='LayerDecayOptimizerConstructor',
-#     paramwise_cfg=dict(num_layers=24, layer_decay_rate=0.8),
-# )
 
 
+# -------------------------
+# 8) Eval / checkpoints / work_dir (same QoL as R50)
+# -------------------------
+evaluation = dict(interval=1, metric='bbox', save_best='bbox_mAP', classwise=True)
+checkpoint_config = dict(interval=1, save_last=True, max_keep_ckpts=2)
+work_dir = './work_dirs/gladius_vitl'
 
 # -------------------------
 # 7) Logging (MMDet v2) — same W&B hook pattern you used
 # -------------------------
 WANDB_PROJECT = os.getenv('WANDB_PROJECT', 'co-detr-hydra')
 WANDB_ENTITY  = os.getenv('WANDB_ENTITY',  'cashel')
-WANDB_RUNNAME = os.getenv('WANDB_RUN_NAME', 'gladius_vitl_abes_gladius_data_vid')
+WANDB_RUNNAME = os.getenv('WANDB_RUN_NAME', 'gladius_vitl_abes_gladius_data_vid_2bs')
+
+img_norm_cfg = dict(
+    mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
+
+# Define pipelines
+val_loss_pipeline = [
+    dict(type='LoadImageFromFile'),
+    dict(type='LoadAnnotations', with_bbox=True),
+    dict(type='Resize', img_scale=(2048, 1280), keep_ratio=True),
+    dict(type='RandomFlip', flip_ratio=0.0),
+    dict(type='Normalize', **img_norm_cfg),
+    dict(type='Pad', size_divisor=32),
+    dict(type='DefaultFormatBundle'),
+    dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels'])
+]
+
+
+# -------------------------
+# Test Pipeline (copy structure from base or define here)
+# -------------------------
+train_eval_pipeline = [
+    dict(type='LoadImageFromFile'),
+    dict(
+        type='MultiScaleFlipAug',
+        img_scale=(2048, 1280),
+        flip=False,
+        transforms=[
+            dict(type='Resize', keep_ratio=True),
+            dict(type='RandomFlip'),
+            dict(type='Normalize', **img_norm_cfg),
+            dict(type='Pad', size_divisor=32),
+            dict(type='ImageToTensor', keys=['img']),
+            dict(type='Collect', keys=['img'])
+        ])
+]
+
+# Datasets
+val_loss_dataset = dict(
+    type='CocoVideoDataset',
+    ann_file=data_root + val_anno,
+    img_prefix=data_root + 'val/' + img_dir,
+    classes=classes,
+    load_as_video=True,
+    test_mode=False,
+    filter_empty_gt=False,
+    pipeline=val_loss_pipeline
+)
+
+train_eval_dataset = dict(
+    type='CocoVideoDataset',
+    ann_file=data_root + train_anno,
+    img_prefix=data_root + 'train/' + img_dir,
+    classes=classes,
+    load_as_video=True,
+    test_mode=True,
+    filter_empty_gt=False,
+    pipeline=train_eval_pipeline
+)
+
+
+custom_imports = dict(
+    imports=[
+          'mmdet.datasets.coco_video',
+          'projects.core.val_loss_hook',
+          'projects.core.train_eval_hook'
+    ],
+    allow_failed_imports=False,
+)
+
+custom_hooks = [
+    dict(
+        type='ExpMomentumEMAHook',
+        momentum=0.0001,
+        priority=49),
+    dict(
+        type='ValLossHook',
+        val_dataset_cfg=val_loss_dataset,
+        interval=1,
+        priority='NORMAL'
+    ),
+    dict(
+        type='TrainEvalHook',
+        dataset_cfg=train_eval_dataset,
+        interval=1,
+        subset_ratio=0.20,
+        priority='NORMAL',
+        metric='bbox', 
+        classwise=True
+    )
+]
 
 log_config = dict(
     interval=50,
@@ -220,7 +292,7 @@ log_config = dict(
                 name=WANDB_RUNNAME,
                 entity=WANDB_ENTITY,
                 tags=['co-detr', 'codino', 'vit-large', 'gladius', '9-classes'],
-                notes='Co-DINO/Co-DETR ViT-L on custom 9-class dataset (MMDet v2).'
+                notes='Co-DINO/Co-DETR ViT-L with Val Loss + Train mAP (20%).'
             ),
             commit=True,
             with_step=True
@@ -228,9 +300,4 @@ log_config = dict(
     ],
 )
 
-# -------------------------
-# 8) Eval / checkpoints / work_dir (same QoL as R50)
-# -------------------------
-evaluation = dict(interval=1, metric='bbox', save_best='bbox_mAP', classwise=True)
-checkpoint_config = dict(interval=1, save_last=True, max_keep_ckpts=2)
-work_dir = './work_dirs/gladius_vitl'
+
