@@ -749,6 +749,7 @@ class DinoTransformerDecoder(DeformableDetrTransformerDecoder):
                 reference_points=None,
                 valid_ratios=None,
                 reg_branches=None,
+                query_temporal_embed=None,
                 **kwargs):
         output = query
         intermediate = []
@@ -768,6 +769,12 @@ class DinoTransformerDecoder(DeformableDetrTransformerDecoder):
             query_pos = self.ref_point_head(query_sine_embed)
 
             query_pos = query_pos.permute(1, 0, 2)
+
+            if query_temporal_embed is not None:
+                query_pos = query_pos + query_temporal_embed
+                if lid == 0:
+                    output = output + query_temporal_embed
+
             output = layer(
                 output,
                 *args,
@@ -775,6 +782,7 @@ class DinoTransformerDecoder(DeformableDetrTransformerDecoder):
                 reference_points=reference_points_input,
                 **kwargs)
             output = output.permute(1, 0, 2)
+
 
             if reg_branches is not None:
                 tmp = reg_branches[lid](output)
@@ -829,10 +837,13 @@ class CoDinoTransformer(CoDeformableDetrTransformer):
 
         self.pos_trans = nn.Linear(self.embed_dims * 2, self.embed_dims * 2)
         self.pos_trans_norm = nn.LayerNorm(self.embed_dims * 2)
+        self.temporal_pos_embed = nn.Embedding(2, self.embed_dims)
 
     def init_weights(self):
         super().init_weights()
         nn.init.normal_(self.query_embed.weight.data)
+        nn.init.normal_(self.temporal_pos_embed.weight.data)
+
 
     def forward(self,
                 mlvl_feats,
@@ -963,9 +974,21 @@ class CoDinoTransformer(CoDeformableDetrTransformer):
                 prev_reference_points,
                 prev_query_valid_lens,
                 attn_masks=attn_mask)
+        
+        # Temporal Embedding
+        temporal_embeddings = None
+        if prev_query_feats is not None and prev_reference_points is not None:
+             # 0 for current queries, 1 for previous queries
+             temp_emb_indices = torch.zeros((bs, query.size(1)), dtype=torch.long, device=query.device)
+             temp_emb_indices[:, detection_query_num:] = 1 
+             temporal_embeddings = self.temporal_pos_embed(temp_emb_indices)
+             
         # decoder
         query = query.permute(1, 0, 2)
         memory = memory.permute(1, 0, 2)
+        if temporal_embeddings is not None:
+            temporal_embeddings = temporal_embeddings.permute(1, 0, 2)
+
         inter_states, inter_references = self.decoder(
             query=query,
             key=None,
@@ -977,6 +1000,7 @@ class CoDinoTransformer(CoDeformableDetrTransformer):
             level_start_index=level_start_index,
             valid_ratios=valid_ratios,
             reg_branches=reg_branches,
+            query_temporal_embed=temporal_embeddings,
             **kwargs)
 
         inter_references_out = inter_references
