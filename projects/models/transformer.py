@@ -870,6 +870,14 @@ class CoDinoTransformer(CoDeformableDetrTransformer):
             d_out = self.pos_trans_norm(self.pos_trans(dummy))
             kwargs['dummy_loss'] = d_out.sum() * 0
 
+        if hasattr(self, 'temporal_pos_embed'):
+            dummy_ind = mlvl_feats[0].new_zeros(1, 1).long()
+            t_out = self.temporal_pos_embed(dummy_ind)
+            if 'dummy_loss' in kwargs:
+                kwargs['dummy_loss'] = kwargs['dummy_loss'] + t_out.sum() * 0
+            else:
+                kwargs['dummy_loss'] = t_out.sum() * 0
+
 
 
         feat_flatten = []
