@@ -171,7 +171,7 @@ optimizer = dict(
 )
 # optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2))
 # lr_config = dict(policy='step', warmup='linear', warmup_iters=500, warmup_ratio=0.01, step=[7])
-# runner = dict(type='EpochBasedRunner', max_epochs=12)
+runner = dict(type='EpochBasedRunner', max_epochs=24)
 # --- Mixed precision (AMP) ---
 # fp16 = dict(loss_scale='dynamic')
 # optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2))
@@ -197,13 +197,20 @@ img_norm_cfg = dict(
 # Define pipelines
 val_loss_pipeline = [
     dict(type='LoadImageFromFile'),
+    dict(type='LoadSeqInfo'),
     dict(type='LoadAnnotations', with_bbox=True),
     dict(type='Resize', img_scale=(2048, 1280), keep_ratio=True),
     dict(type='RandomFlip', flip_ratio=0.0),
     dict(type='Normalize', **img_norm_cfg),
     dict(type='Pad', size_divisor=32),
     dict(type='DefaultFormatBundle'),
-    dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels'])
+    dict(
+        type='Collect',
+        keys=['img', 'gt_bboxes', 'gt_labels'],
+        meta_keys=('filename', 'ori_filename', 'ori_shape', 'img_shape',
+                   'pad_shape', 'scale_factor', 'flip', 'flip_direction',
+                   'img_norm_cfg', 'video_id', 'frame_id', 'is_video_first')
+    )
 ]
 
 
@@ -212,6 +219,7 @@ val_loss_pipeline = [
 # -------------------------
 train_eval_pipeline = [
     dict(type='LoadImageFromFile'),
+    dict(type='LoadSeqInfo'),
     dict(
         type='MultiScaleFlipAug',
         img_scale=(2048, 1280),
@@ -222,9 +230,70 @@ train_eval_pipeline = [
             dict(type='Normalize', **img_norm_cfg),
             dict(type='Pad', size_divisor=32),
             dict(type='ImageToTensor', keys=['img']),
-            dict(type='Collect', keys=['img'])
+            dict(
+                type='Collect',
+                keys=['img'],
+                meta_keys=('filename', 'ori_filename', 'ori_shape', 'img_shape',
+                           'pad_shape', 'scale_factor', 'flip', 'flip_direction',
+                           'img_norm_cfg', 'video_id', 'frame_id', 'is_video_first')
+            )
         ])
 ]
+
+train_pipeline = [
+    dict(type='LoadImageFromFile'),
+    dict(type='LoadSeqInfo'),
+    dict(type='LoadAnnotations', with_bbox=True),
+    dict(type='RandomFlip', flip_ratio=0.5),
+    dict(
+        type='AutoAugment',
+        policies=[
+            [
+                dict(
+                    type='Resize',
+                    img_scale=[(480, 2400), (512, 2400), (544, 2400), (576, 2400),
+                               (608, 2400), (640, 2400), (672, 2400), (704, 2400),
+                               (736, 2400), (768, 2400), (800, 2400), (832, 2400),
+                               ],
+                    multiscale_mode='value',
+                    keep_ratio=True)
+            ],
+            [
+                dict(
+                    type='Resize',
+                    img_scale=[(400, 4200), (500, 4200), (600, 4200)],
+                    multiscale_mode='value',
+                    keep_ratio=True),
+                dict(
+                    type='RandomCrop',
+                    crop_type='absolute_range',
+                    crop_size=(384, 600),
+                    allow_negative_crop=True),
+                dict(
+                    type='Resize',
+                    img_scale=[(480, 2400), (512, 2400), (544, 2400), (576, 2400),
+                               (608, 2400), (640, 2400), (672, 2400), (704, 2400),
+                               (736, 2400), (768, 2400), (800, 2400), (832, 2400),
+                               ],
+                    multiscale_mode='value',
+                    override=True,
+                    keep_ratio=True)
+            ]
+        ]),
+    dict(type='Normalize', **img_norm_cfg),
+    dict(type='Pad', size_divisor=32),
+    dict(type='DefaultFormatBundle'),
+    dict(
+        type='Collect',
+        keys=['img', 'gt_bboxes', 'gt_labels'],
+        meta_keys=('filename', 'ori_filename', 'ori_shape', 'img_shape',
+                   'pad_shape', 'scale_factor', 'flip', 'flip_direction',
+                   'img_norm_cfg', 'video_id', 'frame_id', 'is_video_first')
+    )
+]
+
+# Update the main data pipeline to use this new one
+data['train']['pipeline'] = train_pipeline
 
 # Datasets
 val_loss_dataset = dict(
@@ -254,7 +323,8 @@ custom_imports = dict(
     imports=[
           'mmdet.datasets.coco_video',
           'projects.core.val_loss_hook',
-          'projects.core.train_eval_hook'
+          'projects.core.train_eval_hook',
+          'projects.core.pipeline'
     ],
     allow_failed_imports=False,
 )
