@@ -170,7 +170,14 @@ optimizer = dict(
     paramwise_cfg=dict(num_layers=24, layer_decay_rate=0.8),
 )
 # optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2))
-# lr_config = dict(policy='step', warmup='linear', warmup_iters=500, warmup_ratio=0.01, step=[7])
+lr_config = dict(
+    policy='CosineAnnealing',
+    warmup='linear',
+    warmup_iters=500,
+    warmup_ratio=0.001,
+    min_lr=1e-6
+)
+
 runner = dict(type='EpochBasedRunner', max_epochs=24)
 # --- Mixed precision (AMP) ---
 # fp16 = dict(loss_scale='dynamic')
