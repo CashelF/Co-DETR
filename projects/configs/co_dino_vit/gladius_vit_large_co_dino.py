@@ -49,6 +49,15 @@ model = dict(
         #     ))
         # ),
         num_classes=len(classes),
+        transformer=dict(
+            decoder=dict(transformerlayers=dict(
+                type='TrackingDetrTransformerDecoderLayer',
+                attn_cfgs=[
+                    dict(type='TrackingMultiheadAttention', embed_dims=256, num_heads=8, dropout=0.0), 
+                    dict(type='MultiScaleDeformableAttention', embed_dims=256, num_levels=5, dropout=0.0)
+                ]
+            ))
+        ),
     ),
 
 
@@ -171,6 +180,7 @@ optimizer = dict(
 )
 # optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2))
 lr_config = dict(
+    _delete_=True,
     policy='CosineAnnealing',
     warmup='linear',
     warmup_iters=500,

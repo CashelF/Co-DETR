@@ -1,15 +1,16 @@
 import math
 import warnings
+import copy
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from mmcv.cnn import xavier_init
-from mmcv.cnn.bricks.registry import TRANSFORMER_LAYER_SEQUENCE
-from mmcv.cnn.bricks.transformer import TransformerLayerSequence
+from mmcv.cnn.bricks.registry import TRANSFORMER_LAYER_SEQUENCE, TRANSFORMER_LAYER, ATTENTION
+from mmcv.cnn.bricks.transformer import TransformerLayerSequence, MultiheadAttention
 
-from mmdet.models.utils.transformer import Transformer, DeformableDetrTransformer, DeformableDetrTransformerDecoder
+from mmdet.models.utils.transformer import Transformer, DeformableDetrTransformer, DeformableDetrTransformerDecoder, DetrTransformerDecoderLayer
 from mmdet.models.utils.builder import TRANSFORMER
 
 
@@ -800,11 +801,20 @@ class DinoTransformerDecoder(DeformableDetrTransformerDecoder):
                 # NOTE this is for the "Look Forward Twice" module,
                 # in the DeformDETR, reference_points was appended.
 
+        # Collect attention weights from TrackingDetrTransformerDecoderLayer
+        previous_query_attn_proportions = []
+        for layer in self.layers:
+            if hasattr(layer, 'attentions') and len(layer.attentions) > 0:
+                self_attn = layer.attentions[0] # Assuming first one is self-attn
+                if hasattr(self_attn, 'last_attn_weights') and self_attn.last_attn_weights is not None:
+                    weights = self_attn.last_attn_weights # (bs, N, N)
+                    previous_query_attn_proportions.append(weights)
+
         if self.return_intermediate:
             return torch.stack(intermediate), torch.stack(
-                intermediate_reference_points)
+                intermediate_reference_points), previous_query_attn_proportions
 
-        return output, reference_points
+        return output, reference_points, previous_query_attn_proportions
 
 @TRANSFORMER.register_module()
 class CoDinoTransformer(CoDeformableDetrTransformer):
@@ -997,7 +1007,7 @@ class CoDinoTransformer(CoDeformableDetrTransformer):
         if temporal_embeddings is not None:
             temporal_embeddings = temporal_embeddings.permute(1, 0, 2)
 
-        inter_states, inter_references = self.decoder(
+        inter_states, inter_references, attn_weights_list = self.decoder(
             query=query,
             key=None,
             value=memory,
@@ -1020,7 +1030,28 @@ class CoDinoTransformer(CoDeformableDetrTransformer):
                 detection_query_num,
                 dn_query_num)
 
-        return inter_states, inter_references_out, topk_score, topk_anchor, memory, decoder_cache
+        # Calculate attention metrics
+        # Structure: [DN, Detection, Previous]
+        # We want attention of Detection Queries -> Previous Queries
+        attn_metrics = {}
+        if len(attn_weights_list) > 0:
+            start_det = dn_query_num
+            end_det = dn_query_num + detection_query_num
+            start_prev = end_det
+            
+            for i, weights in enumerate(attn_weights_list):
+                if weights.shape[1] > start_prev: # Check if there are previous queries
+                    det_to_prev_weights = weights[:, start_det:end_det, start_prev:]
+                    # Sum over columns (target previous queries)
+                    prev_attn_sum = det_to_prev_weights.sum(dim=-1) # (bs, num_det)
+                    # Average over queries and batch
+                    avg_prev_attn = prev_attn_sum.mean()
+                    # Ensure metric is on the same device as query (GPU)
+                    attn_metrics[f'layer_{i}_prev_attn_prop'] = avg_prev_attn.to(query.device)
+                else:
+                    attn_metrics[f'layer_{i}_prev_attn_prop'] = torch.tensor(0.0, device=query.device)
+
+        return inter_states, inter_references_out, topk_score, topk_anchor, memory, decoder_cache, attn_metrics
 
 
     def forward_aux(self,
@@ -1078,7 +1109,7 @@ class CoDinoTransformer(CoDeformableDetrTransformer):
         # decoder
         query = query.permute(1, 0, 2)
         memory = memory.permute(1, 0, 2)
-        inter_states, inter_references = self.decoder(
+        inter_states, inter_references, attn_weights_list = self.decoder(
             query=query,
             key=None,
             value=memory,
@@ -1094,3 +1125,113 @@ class CoDinoTransformer(CoDeformableDetrTransformer):
         inter_references_out = inter_references
 
         return inter_states, inter_references_out
+
+@ATTENTION.register_module()
+class TrackingMultiheadAttention(MultiheadAttention):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.last_attn_weights = None
+
+    def forward(self, query, key=None, value=None, *args, **kwargs):
+        # Only pass specific arguments to self.attn (nn.MultiheadAttention)
+        # to avoid errors with extra arguments passed by Co-DETR transformer.
+        attn_kwargs = {}
+        if 'key_padding_mask' in kwargs:
+            attn_kwargs['key_padding_mask'] = kwargs['key_padding_mask']
+        if 'attn_mask' in kwargs:
+            attn_kwargs['attn_mask'] = kwargs['attn_mask']
+        
+        if key is None:
+            key = query
+        if value is None:
+            value = key
+
+        if self.batch_first:
+            query = query.transpose(0, 1)
+            key = key.transpose(0, 1)
+            value = value.transpose(0, 1)
+
+        out, attn_weights = self.attn(
+            query,
+            key,
+            value,
+            *args,
+            need_weights=True,
+            average_attn_weights=True, # We want averaged for simplifying the metric
+            **attn_kwargs)
+        
+        self.last_attn_weights = attn_weights.detach()
+        
+        if self.batch_first:
+            out = out.transpose(0, 1)
+            
+        return out
+
+
+@TRANSFORMER_LAYER.register_module()
+class TrackingDetrTransformerDecoderLayer(DetrTransformerDecoderLayer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+    def forward(self,
+                query,
+                key=None,
+                value=None,
+                query_pos=None,
+                key_pos=None,
+                attn_masks=None,
+                query_key_padding_mask=None,
+                key_padding_mask=None,
+                **kwargs):
+        
+        norm_index = 0
+        attn_index = 0
+        ffn_index = 0
+        identity = query
+        if attn_masks is None:
+            attn_masks = [None for _ in range(len(self.attentions))]
+        elif isinstance(attn_masks, torch.Tensor):
+            attn_masks = [
+                copy.deepcopy(attn_masks) for _ in range(len(self.attentions))
+            ]
+            warnings.warn(f'Use same attn_mask in all attentions in '
+                          f'{self.__class__.__name__} ')
+        else:
+            assert len(attn_masks) == len(self.attentions)
+
+        for layer in self.operation_order:
+            if layer == 'self_attn':
+                temp_key = temp_value = query
+                query_select = query + query_pos if query_pos is not None else query
+                temp_attn_mask = attn_masks[attn_index]
+                query = self.attentions[attn_index](
+                    query_select,
+                    temp_key,
+                    temp_value,
+                    attn_mask=temp_attn_mask,
+                    key_padding_mask=query_key_padding_mask,
+                    **kwargs)
+                attn_index += 1
+                identity = query
+            elif layer == 'norm':
+                query = self.norms[norm_index](query)
+                norm_index += 1
+            elif layer == 'cross_attn':
+                temp_key = temp_value = value
+                query_select = query + query_pos if query_pos is not None else query
+                key_select = temp_key + key_pos if key_pos is not None else temp_key
+                temp_attn_mask = attn_masks[attn_index]
+                query = self.attentions[attn_index](
+                    query_select,
+                    key_select,
+                    temp_value,
+                    attn_mask=temp_attn_mask,
+                    key_padding_mask=key_padding_mask,
+                    **kwargs)
+                attn_index += 1
+                identity = query
+            elif layer == 'ffn':
+                query = self.ffns[ffn_index](query, identity if self.pre_norm else None)
+                ffn_index += 1
+
+        return query

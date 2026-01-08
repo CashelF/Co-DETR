@@ -72,11 +72,17 @@ class CoDINOHead(CoDeformDETRHead):
                               self.label_embedding, img_metas)
         outs = self(x, img_metas, dn_label_query, dn_bbox_query, attn_mask)
         head_outputs = outs[:5]
+        attn_metrics = outs[-1] # Assuming it's the last element now
         if gt_labels is None:
             loss_inputs = head_outputs + (gt_bboxes, img_metas, dn_meta)
         else:
             loss_inputs = head_outputs + (gt_bboxes, gt_labels, img_metas, dn_meta)
         losses = self.loss(*loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
+        
+        # Add attention metrics to losses for logging
+        if attn_metrics is not None and isinstance(attn_metrics, dict):
+            losses.update(attn_metrics)
+            
         enc_outputs = head_outputs[-1]
         with torch.no_grad():
             tmp_results_list = self.get_bboxes(*head_outputs, img_metas=img_metas, rescale=False, with_nms=False)
@@ -110,8 +116,7 @@ class CoDINOHead(CoDeformDETRHead):
         prev_query_feats_list, prev_reference_points_list, prev_valid_lengths = (
             self._collect_prev_queries(img_metas))
 
-        hs, inter_references, topk_score, topk_anchor, enc_outputs, decoder_cache = \
-            self.transformer(
+        transformer_out = self.transformer(
                 mlvl_feats,
                 mlvl_masks,
                 query_embeds,
@@ -126,6 +131,15 @@ class CoDINOHead(CoDeformDETRHead):
                 reg_branches=self.reg_branches if self.with_box_refine else None,  # noqa:E501
                 cls_branches=self.cls_branches if self.as_two_stage else None  # noqa:E501
             )
+
+        # Unpack the results including attn_metrics
+        if len(transformer_out) == 7:
+            hs, inter_references, topk_score, topk_anchor, enc_outputs, decoder_cache, attn_metrics = transformer_out
+        else:
+             # Fallback if modification failed or mismatch
+            hs, inter_references, topk_score, topk_anchor, enc_outputs, decoder_cache = transformer_out
+            attn_metrics = {}
+
         outs = []
         num_level = len(mlvl_feats)
         start = 0
@@ -166,7 +180,9 @@ class CoDINOHead(CoDeformDETRHead):
         outputs_coords = torch.stack(outputs_coords)
         self._update_sequence_cache(img_metas, decoder_cache)
 
-        return outputs_classes, outputs_coords, topk_score, topk_anchor, outs, decoder_cache
+        self._update_sequence_cache(img_metas, decoder_cache)
+
+        return outputs_classes, outputs_coords, topk_score, topk_anchor, outs, decoder_cache, attn_metrics
 
     def loss(self,
              all_cls_scores,
