@@ -623,10 +623,18 @@ class CoDINOHead(CoDeformDETRHead):
         N_new = self.num_query
         N_track = self.num_track_queries
         
-        # If sizes mismatch (e.g. transformer didn't include tracks), abort specific track update
-        if N_all < N_track + N_new:
-             # Fallback or error? Silent return for safety if transformer wasn't updated correctly
+        # If sizes mismatch (e.g. transformer didn't include tracks), we might be in Frame 1
+        # where only New queries existed.
+        has_tracks_in_output = (N_all >= N_new + N_track)
+        
+        if N_all < N_new:
+             # Critical error, less than new queries?
              return
+
+        # NOTE: Cached features are from PREVIOUS query interaction (input to transformer)
+        # We need "Output of Transformer" for NEXT frame?
+        # No, "Output of Transformer" = "Input to Next Frame".
+        # Correct.
 
         for idx, meta in enumerate(img_metas):
             seq_key = self._get_sequence_key(meta)
@@ -638,10 +646,13 @@ class CoDINOHead(CoDeformDETRHead):
             
             # Feats for NEXT frame
             out_new_feats = cached_feats[idx, :N_new]
-            out_track_feats = cached_feats[idx, N_new : N_new + N_track]
-            
             out_new_refs = cached_refs[idx, :N_new]
-            out_track_refs = cached_refs[idx, N_new : N_new + N_track]
+            
+            out_track_feats = None
+            out_track_refs = None
+            if has_tracks_in_output:
+                out_track_feats = cached_feats[idx, N_new : N_new + N_track]
+                out_track_refs = cached_refs[idx, N_new : N_new + N_track]
             
             # Scores for CURRENT frame
             # scores are usually [N, NumClasses]. We need max score?
@@ -652,9 +663,14 @@ class CoDINOHead(CoDeformDETRHead):
             if self.loss_cls.use_sigmoid:
                 score_new = score_new.sigmoid()
             
-            score_track, _ = pred_cls[N_new : N_new + N_track].max(-1)
-            if self.loss_cls.use_sigmoid:
-                 score_track = score_track.sigmoid()
+            score_track = None
+            if has_tracks_in_output:
+                score_track, _ = pred_cls[N_new : N_new + N_track].max(-1)
+                if self.loss_cls.use_sigmoid:
+                     score_track = score_track.sigmoid()
+            else:
+                 # Dummy scores for missing tracks (all should be inactive anyway)
+                 score_track = torch.zeros(N_track, device=pred_cls.device)
             
             # --- 2. Track Lifecycle ---
             
@@ -666,8 +682,14 @@ class CoDINOHead(CoDeformDETRHead):
                 current_track_info = torch.full((N_track, 2), -1, device=batch_cls.device)
             
             next_track_info = current_track_info.clone()
-            next_track_feats = out_track_feats.clone()
-            next_track_refs = out_track_refs.clone()
+            
+            if out_track_feats is not None:
+                next_track_feats = out_track_feats.clone()
+                next_track_refs = out_track_refs.clone()
+            else:
+                # No track outputs? Initialize to defaults (will be overwritten by spawns or remain inactive)
+                next_track_feats = self.track_embed.weight.clone()
+                next_track_refs = torch.tensor([0.5, 0.5, 1.0, 1.0], device=batch_cls.device).unsqueeze(0).repeat(N_track, 1)
             
             # Identify active tracks
             active_mask = current_track_info[:, 0] >= 0
