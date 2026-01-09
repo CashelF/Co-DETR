@@ -749,9 +749,9 @@ class CoDINOHead(CoDeformDETRHead):
 
             # --- 3. Save to Cache ---
             self._prev_decoder_cache[seq_key] = {
-                'query_feats': next_track_feats.detach().cpu(),
-                'reference_points': next_track_refs.detach().cpu(),
-                'track_info': next_track_info.cpu(),
+                'query_feats': next_track_feats.detach(),
+                'reference_points': next_track_refs.detach(),
+                'track_info': next_track_info,
                 'valid_length': N_track
             }
 
