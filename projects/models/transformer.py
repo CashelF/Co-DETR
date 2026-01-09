@@ -378,10 +378,24 @@ class CoDeformableDetrTransformer(DeformableDetrTransformer):
         inter_references_out = inter_references
         decoder_cache = None
         if return_decoder_cache:
+            # If tracking (prev queries exist), we want to cache everything (New + Tracks)
+            # detection_query_num currently equals base_query_num (New).
+            # If we appended tracks, query size increased.
+            # We should cache all detection queries (New + Track).
+            # dn_query_num is 0 usually here (handled elsewhere?).
+            # Valid query range is [:total_query_num] if no DN, or handled by build_decoder_cache logic.
+            # _build_decoder_cache uses detection_query_num as "length".
+            
+            queries_to_cache = detection_query_num
+            if prev_query_feats is not None:
+                # If we added tracks, we want to cache them too.
+                # Tracks are appended at the end.
+                queries_to_cache = detection_query_num + prev_query_feats.size(1)
+            
             decoder_cache = self._build_decoder_cache(
                 inter_states,
                 inter_references_out,
-                detection_query_num,
+                queries_to_cache,
                 dn_query_num)
         if self.as_two_stage:
             if return_encoder_output:

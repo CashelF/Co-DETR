@@ -49,6 +49,10 @@ model = dict(
         #     ))
         # ),
         num_classes=len(classes),
+        num_track_queries=300,  # [NEW] Persistent track slots
+        spawn_score_thresh=0.4, # [NEW] Threshold to spawn new track
+        miss_tolerance=5,       # [NEW] Frames to keep lost track
+        track_loss_weight=1.0,  # [NEW] Weight for track supervision
         transformer=dict(
             decoder=dict(transformerlayers=dict(
                 type='TrackingDetrTransformerDecoderLayer',

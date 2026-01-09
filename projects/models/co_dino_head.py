@@ -17,6 +17,10 @@ class CoDINOHead(CoDeformDETRHead):
     def __init__(self,
                  *args,
                  num_query=900,
+                 num_track_queries=0,
+                 spawn_score_thresh=0.5,
+                 miss_tolerance=1,
+                 track_loss_weight=1.0,
                  dn_cfg=None,
                  transformer=None,
                  **kwargs):
@@ -26,8 +30,15 @@ class CoDINOHead(CoDeformDETRHead):
                 'two_stage_num_proposals must be equal to num_query for DINO'
         else:
             transformer['two_stage_num_proposals'] = num_query
+        self.num_track_queries = num_track_queries
+        self.spawn_score_thresh = spawn_score_thresh
+        self.miss_tolerance = miss_tolerance
+        self.track_loss_weight = track_loss_weight
+
         super(CoDINOHead, self).__init__(
             *args, num_query=num_query, transformer=transformer, **kwargs)
+        
+
 
         assert self.as_two_stage, \
             'as_two_stage must be True for DINO'
@@ -45,6 +56,13 @@ class CoDINOHead(CoDeformDETRHead):
         # is not used in the original DINO
         self.label_embedding = nn.Embedding(self.cls_out_channels,
                                             self.embed_dims)
+        # Learnable embedding for empty/new track slots
+        if self.num_track_queries > 0:
+            self.track_embed = nn.Embedding(self.num_track_queries, self.embed_dims)
+            # Track state buffer: [matched_id, miss_count] (-1 = empty)
+            # We don't register this as a buffer because it's per-sequence and handled via cache,
+            # but we can keep a template or helper if needed.
+
         self.downsample = nn.Sequential(
             nn.Conv2d(self.embed_dims, self.embed_dims, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(32, self.embed_dims)
@@ -70,7 +88,8 @@ class CoDINOHead(CoDeformDETRHead):
         dn_label_query, dn_bbox_query, attn_mask, dn_meta = \
             self.dn_generator(gt_bboxes, gt_labels,
                               self.label_embedding, img_metas)
-        outs = self(x, img_metas, dn_label_query, dn_bbox_query, attn_mask)
+        outs = self(x, img_metas, dn_label_query, dn_bbox_query, attn_mask, 
+                   gt_bboxes=gt_bboxes, gt_labels=gt_labels)
         head_outputs = outs[:5]
         attn_metrics = outs[-1] # Assuming it's the last element now
         if gt_labels is None:
@@ -94,7 +113,9 @@ class CoDINOHead(CoDeformDETRHead):
                 img_metas,
                 dn_label_query=None,
                 dn_bbox_query=None,
-                attn_mask=None):
+                attn_mask=None,
+                gt_bboxes=None,
+                gt_labels=None):
         batch_size = mlvl_feats[0].size(0)
         input_img_h, input_img_w = img_metas[0]['batch_input_shape']
         img_masks = mlvl_feats[0].new_ones(
@@ -178,9 +199,10 @@ class CoDINOHead(CoDeformDETRHead):
 
         outputs_classes = torch.stack(outputs_classes)
         outputs_coords = torch.stack(outputs_coords)
-        self._update_sequence_cache(img_metas, decoder_cache)
-
-        self._update_sequence_cache(img_metas, decoder_cache)
+        
+        # Pass outputs to update cache
+        self._update_sequence_cache(img_metas, decoder_cache, 
+                                    outputs_classes, outputs_coords)
 
         return outputs_classes, outputs_coords, topk_score, topk_anchor, outs, decoder_cache, attn_metrics
 
@@ -525,6 +547,214 @@ class CoDINOHead(CoDeformDETRHead):
 
         return outputs_classes, outputs_coords, \
                 None, None
+
+    def _collect_prev_queries(self, img_metas):
+        """
+        Collect fixed-size track queries from cache or initialize them.
+        Returns:
+            prev_query_feats_list: List of [N_track, C] tensors
+            prev_reference_points_list: List of [N_track, 4] tensors 
+            prev_valid_lengths: List of ints (always N_track if tracking enabled)
+        """
+        if self.num_track_queries <= 0:
+            return super()._collect_prev_queries(img_metas)
+
+        device = self.label_embedding.weight.device
+        dtype = self.label_embedding.weight.dtype
+        
+        prev_query_feats_list = []
+        prev_reference_points_list = []
+        prev_valid_lengths = []
+
+        for meta in img_metas:
+            seq_key = self._get_sequence_key(meta)
+            reset = self._should_reset_sequence(meta)
+            
+            cached = None
+            if not reset and seq_key is not None:
+                cached = self._prev_decoder_cache.get(seq_key, None)
+            
+            if cached is None:
+                # Initialize empty tracks [N_track, C]
+                feats = self.track_embed.weight.clone()
+                # Refs: [N_track, 4] -> Center [0.5, 0.5, 1.0, 1.0]
+                refs = torch.tensor([0.5, 0.5, 1.0, 1.0], device=device, dtype=dtype).unsqueeze(0).repeat(self.num_track_queries, 1)
+                
+                # Track Info: [id, miss_count] (-1 = empty)
+                track_info = torch.full((self.num_track_queries, 2), -1, device=device, dtype=torch.long)
+                track_info[:, 1] = 0 # miss count
+                
+                if seq_key is not None:
+                    # Clear old cache if it existed but we reset
+                    self._prev_decoder_cache.pop(seq_key, None)
+            else:
+                feats = cached['query_feats'].to(device).to(dtype)
+                refs = cached['reference_points'].to(device).to(dtype)
+                track_info = cached['track_info'].to(device)
+
+            prev_query_feats_list.append(feats)
+            prev_reference_points_list.append(refs)
+            prev_valid_lengths.append(self.num_track_queries)
+            
+            meta['track_info'] = track_info
+
+        return prev_query_feats_list, prev_reference_points_list, prev_valid_lengths
+
+    def _update_sequence_cache(self, img_metas, decoder_cache, outputs_classes=None, outputs_coords=None):
+        if self.num_track_queries <= 0:
+            return super()._update_sequence_cache(img_metas, decoder_cache)
+        
+        if decoder_cache is None or outputs_classes is None or outputs_coords is None:
+            return
+
+        batch_cls = outputs_classes[-1]  # [B, N_all, C]
+        batch_box = outputs_coords[-1]   # [B, N_all, 4]
+        
+        # Transformer outputs
+        # [B, N_all, C]
+        cached_feats = decoder_cache.get('query_feats') 
+        # [B, N_all, 4] (if sigmoid)
+        cached_refs = decoder_cache.get('reference_points')
+        
+        if cached_feats is None or cached_refs is None:
+            return
+
+        N_all = cached_feats.size(1)
+        N_new = self.num_query
+        N_track = self.num_track_queries
+        
+        # If sizes mismatch (e.g. transformer didn't include tracks), abort specific track update
+        if N_all < N_track + N_new:
+             # Fallback or error? Silent return for safety if transformer wasn't updated correctly
+             return
+
+        for idx, meta in enumerate(img_metas):
+            seq_key = self._get_sequence_key(meta)
+            if seq_key is None:
+                continue
+            
+            # --- 1. Slicing ---
+            # Transformer appends tracks: [Q_new, Q_track]
+            
+            # Feats for NEXT frame
+            out_new_feats = cached_feats[idx, :N_new]
+            out_track_feats = cached_feats[idx, N_new : N_new + N_track]
+            
+            out_new_refs = cached_refs[idx, :N_new]
+            out_track_refs = cached_refs[idx, N_new : N_new + N_track]
+            
+            # Scores for CURRENT frame
+            # scores are usually [N, NumClasses]. We need max score?
+            pred_cls = batch_cls[idx] # [N_all, C]
+            pred_box = batch_box[idx] # [N_all, 4]
+            
+            score_new, _ = pred_cls[:N_new].max(-1) # sigmoid score or logit?
+            if self.loss_cls.use_sigmoid:
+                score_new = score_new.sigmoid()
+            
+            score_track, _ = pred_cls[N_new : N_new + N_track].max(-1)
+            if self.loss_cls.use_sigmoid:
+                 score_track = score_track.sigmoid()
+            
+            # --- 2. Track Lifecycle ---
+            
+            # Retrieve current track info (loaded in _collect)
+            # [id, miss_count]
+            # We need to construct the NEXT track info.
+            current_track_info = meta.get('track_info', None)
+            if current_track_info is None:
+                current_track_info = torch.full((N_track, 2), -1, device=batch_cls.device)
+            
+            next_track_info = current_track_info.clone()
+            next_track_feats = out_track_feats.clone()
+            next_track_refs = out_track_refs.clone()
+            
+            # Identify active tracks
+            active_mask = current_track_info[:, 0] >= 0
+            
+            # A. Update Active Tracks
+            # Simple Logic: If score > thresh, keep. Else miss.
+            # (Ideally matching to GT if training, but stick to simple for now)
+            
+            # Check hits
+            is_hit = score_track > self.spawn_score_thresh # Reuse spawn thresh or add track_thresh
+            
+            # If hit -> miss_count = 0. Feature updated (already taken from out_track_feats).
+            next_track_info[active_mask & is_hit, 1] = 0
+            
+            # If miss -> miss_count += 1. 
+            # Feature? Keep OLD feature? Or use new prediction? 
+            # If it's a miss, the prediction is likely background/garbage.
+            # Better to strictly KEEP OLD FEATURE if missed to avoid drift into background.
+            # But we need access to OLD feature. Is it in `out_track_feats`? 
+            # `out_track_feats` is the refined output.
+            # We need `prev_query_feats` which was INPUT.
+            # It's not readily available here unless we stored it in meta or cache.
+            # We can read from `self._prev_decoder_cache` (previous state).
+            prev_cache = self._prev_decoder_cache.get(seq_key)
+            if prev_cache is not None:
+                prev_feats_input = prev_cache['query_feats'].to(batch_cls.device)
+                prev_refs_input = prev_cache['reference_points'].to(batch_cls.device)
+                
+                # Restore features for misses
+                miss_indices = active_mask & (~is_hit)
+                if miss_indices.any():
+                    next_track_info[miss_indices, 1] += 1
+                    # Restore previous features/refs to avoid polluting with background
+                    next_track_feats[miss_indices] = prev_feats_input[miss_indices]
+                    next_track_refs[miss_indices] = prev_refs_input[miss_indices]
+            
+            # B. Retire Dead Tracks
+            dead_mask = next_track_info[:, 1] > self.miss_tolerance
+            next_track_info[dead_mask, 0] = -1 # ID -> -1 (empty)
+            next_track_info[dead_mask, 1] = 0
+            # Reset features for dead slots to learnable embedding?
+            if dead_mask.any():
+                 next_track_feats[dead_mask] = self.track_embed.weight[dead_mask]
+                 # Reset refs to center?
+                 # Assuming refs are sigmoid:
+                 next_track_refs[dead_mask] = torch.tensor([0.5, 0.5, 1.0, 1.0], device=batch_cls.device).to(batch_cls.dtype)
+
+            # C. Spawn New Tracks
+            # Find empty slots
+            empty_mask = next_track_info[:, 0] < 0
+            num_empty = empty_mask.sum().item()
+            
+            if num_empty > 0:
+                # Find high confidence new detections
+                # Simple NMS-like or just top-k?
+                # Greedy: Top-k scores
+                top_vals, top_inds = torch.topk(score_new, k=min(num_empty, N_new))
+                
+                # Filter by threshold
+                valid_new = top_vals > self.spawn_score_thresh
+                spawn_inds = top_inds[valid_new]
+                
+                if len(spawn_inds) > 0:
+                    # Fill empty slots
+                    empty_indices = torch.nonzero(empty_mask, as_tuple=True)[0]
+                    num_spawn = min(len(spawn_inds), len(empty_indices))
+                    
+                    fill_slots = empty_indices[:num_spawn]
+                    source_inds = spawn_inds[:num_spawn]
+                    
+                    next_track_feats[fill_slots] = out_new_feats[source_inds]
+                    next_track_refs[fill_slots] = out_new_refs[source_inds]
+                    
+                    # Assign New IDs? 
+                    # If we don't have global ID management, we just mark as "Active" (id=1, or increments).
+                    # For now just set ID=1 to mark used.
+                    next_track_info[fill_slots, 0] = 1 
+                    next_track_info[fill_slots, 1] = 0
+
+            # --- 3. Save to Cache ---
+            self._prev_decoder_cache[seq_key] = {
+                'query_feats': next_track_feats.detach().cpu(),
+                'reference_points': next_track_refs.detach().cpu(),
+                'track_info': next_track_info.cpu(),
+                'valid_length': N_track
+            }
+
 
     def loss_single(self,
                     cls_scores,
