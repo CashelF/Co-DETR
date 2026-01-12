@@ -10,6 +10,8 @@ from mmdet.models.builder import HEADS
 from mmcv.ops import batched_nms
 from projects.models import CoDeformDETRHead
 from projects.models.query_denoising import build_dn_generator
+from mmcv.runner import get_dist_info
+from mmdet.utils import get_root_logger
 
 @HEADS.register_module()
 class CoDINOHead(CoDeformDETRHead):
@@ -21,6 +23,7 @@ class CoDINOHead(CoDeformDETRHead):
                  spawn_score_thresh=0.5,
                  miss_tolerance=1,
                  track_loss_weight=1.0,
+                 query_init_checkpoint=None,
                  dn_cfg=None,
                  transformer=None,
                  **kwargs):
@@ -34,6 +37,7 @@ class CoDINOHead(CoDeformDETRHead):
         self.spawn_score_thresh = spawn_score_thresh
         self.miss_tolerance = miss_tolerance
         self.track_loss_weight = track_loss_weight
+        self.query_init_checkpoint = query_init_checkpoint
 
         super(CoDINOHead, self).__init__(
             *args, num_query=num_query, transformer=transformer, **kwargs)
@@ -57,6 +61,7 @@ class CoDINOHead(CoDeformDETRHead):
         self.label_embedding = nn.Embedding(self.cls_out_channels,
                                             self.embed_dims)
         # Learnable embedding for empty/new track slots
+        # NOTE: track_embed is initialized randomly by default (nn.Embedding behaviour)
         if self.num_track_queries > 0:
             self.track_embed = nn.Embedding(self.num_track_queries, self.embed_dims)
             # Track state buffer: [matched_id, miss_count] (-1 = empty)
@@ -68,6 +73,64 @@ class CoDINOHead(CoDeformDETRHead):
             nn.GroupNorm(32, self.embed_dims)
         )
         
+        
+    def init_weights(self):
+        super().init_weights()
+        # [Custom Checkpoint Loading]
+        if self.query_init_checkpoint is not None:
+            logger = get_root_logger()
+            rank, _ = get_dist_info()
+            if rank == 0:
+                logger.info(f"[CoDINOHead] Loading query_init_checkpoint: {self.query_init_checkpoint}")
+            
+            try:
+                ckpt = torch.load(self.query_init_checkpoint, map_location='cpu')
+                if 'state_dict' in ckpt:
+                    ckpt = ckpt['state_dict']
+                
+                # Potential keys for query_embed in standard Co-DETR/DINO checkpoints
+                key_cands = [
+                    'query_head.transformer.query_embed.weight',
+                    'query_head.query_embedding.weight',
+                    'transformer.query_embed.weight'
+                ]
+                
+                loaded_weight = None
+                for key in key_cands:
+                    if key in ckpt:
+                        loaded_weight = ckpt[key]
+                        if rank == 0: logger.info(f"[CoDINOHead] Found queries in checkpoint key: {key}")
+                        break
+                
+                if loaded_weight is not None:
+                    # Target: self.transformer.query_embed
+                    if hasattr(self.transformer, 'query_embed'):
+                        target_embed = self.transformer.query_embed
+                        N_ckpt = loaded_weight.size(0)
+                        N_model = target_embed.weight.size(0)
+                        
+                        if rank == 0:
+                             logger.info(f"[CoDINOHead] Checkpoint queries: {N_ckpt}, Model New Object queries: {N_model}")
+                        
+                        # Handle size mismatch (slice)
+                        if N_ckpt >= N_model:
+                             with torch.no_grad():
+                                 target_embed.weight.copy_(loaded_weight[:N_model])
+                             if rank == 0:
+                                 logger.info(f"[CoDINOHead] Successfully loaded first {N_model} queries from checkpoint to transformer.query_embed.")
+                        else:
+                             if rank == 0:
+                                 logger.warning(f"[CoDINOHead] Checkpoint has FEWER queries ({N_ckpt}) than model ({N_model}). Skipping load to avoid undefined behavior.")
+                    else:
+                        if rank == 0:
+                            logger.warning("[CoDINOHead] self.transformer does not have 'query_embed' attribute.")
+                else:
+                    if rank == 0:
+                         logger.warning(f"[CoDINOHead] Could not find any of keys {key_cands} in checkpoint.")
+            except Exception as e:
+                 if rank == 0:
+                     logger.error(f"[CoDINOHead] Error loading query checkpoint: {e}")
+
     def init_denoising(self, dn_cfg):
         if dn_cfg is not None:
             dn_cfg['num_classes'] = self.num_classes
@@ -237,6 +300,32 @@ class CoDINOHead(CoDeformDETRHead):
             loss_dict['enc_loss_cls'] = enc_loss_cls
             loss_dict['enc_loss_bbox'] = enc_losses_bbox
             loss_dict['enc_loss_iou'] = enc_losses_iou
+        
+        # [Logging] Track vs New detection stats
+        if self.num_track_queries > 0:
+            with torch.no_grad():
+                # Last decoder layer scores
+                last_scores = all_cls_scores[-1].sigmoid() # [B, Q_all, C]
+                max_scores, _ = last_scores.max(-1) # [B, Q_all]
+                
+                # Split
+                N_new = self.num_query
+                scores_new = max_scores[:, :N_new]
+                scores_track = max_scores[:, N_new : N_new + self.num_track_queries]
+                
+                # Count detections > threshold (e.g. 0.3 matching visualization)
+                thresh = 0.3
+                n_new_det = (scores_new > thresh).float().sum()
+                n_track_det = (scores_track > thresh).float().sum()
+                total_det = n_new_det + n_track_det
+                
+                # Avoid division by zero
+                ratio_track = n_track_det / (total_det + 1e-6)
+                
+                # Add to loss_dict (keys without 'loss' are logged but not optimized)
+                loss_dict['stat_num_new_det'] = n_new_det / max(1, len(scores_new)) # Normalize by batch? No, just average count per batch via reduce_mean later
+                loss_dict['stat_num_track_det'] = n_track_det / max(1, len(scores_new))
+                loss_dict['stat_track_ratio'] = ratio_track
 
         # calculate loss from all decoder layers
         num_dec_layers = len(all_cls_scores)
@@ -566,6 +655,10 @@ class CoDINOHead(CoDeformDETRHead):
         prev_reference_points_list = []
         prev_valid_lengths = []
 
+        # [DDP Fix] Always touch track_embed to keep it in the graph
+        # Prevents "Unused parameter" error without using find_unused_parameters=True (which breaks checkpointing)
+        dummy_tensor = self.track_embed.weight.sum() * 0.0
+
         for meta in img_metas:
             seq_key = self._get_sequence_key(meta)
             reset = self._should_reset_sequence(meta)
@@ -589,6 +682,9 @@ class CoDINOHead(CoDeformDETRHead):
                     self._prev_decoder_cache.pop(seq_key, None)
             else:
                 feats = cached['query_feats'].to(device).to(dtype)
+                # [DDP Fix] Add dummy dependency
+                feats = feats + dummy_tensor
+                
                 refs = cached['reference_points'].to(device).to(dtype)
                 track_info = cached['track_info'].to(device)
 

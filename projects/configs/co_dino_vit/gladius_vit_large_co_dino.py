@@ -53,6 +53,8 @@ model = dict(
         spawn_score_thresh=0.4, # [NEW] Threshold to spawn new track
         miss_tolerance=5,       # [NEW] Frames to keep lost track
         track_loss_weight=1.0,  # [NEW] Weight for track supervision
+        # query_init_checkpoint='codetr-chkpt.pt', # [NEW] Init queries from checkpoint
+        query_init_checkpoint=None,
         transformer=dict(
             decoder=dict(transformerlayers=dict(
                 type='TrackingDetrTransformerDecoderLayer',
@@ -167,7 +169,7 @@ data = dict(
 # 5) Pretrained checkpoint (COCO objects, ViT-L Co-DINO/Co-DETR)
 #    Put the .pth under ./checkpoints and point here.
 # -------------------------
-load_from = 'checkpoints/co_dino_5scale_vit_large_coco.pth'
+load_from = 'codetr-chkpt.pt'
 
 # -------------------------
 # 6) Optim/schedule:
@@ -210,7 +212,7 @@ work_dir = './work_dirs/gladius_vitl'
 # -------------------------
 WANDB_PROJECT = os.getenv('WANDB_PROJECT', 'co-detr-hydra')
 WANDB_ENTITY  = os.getenv('WANDB_ENTITY',  'cashel')
-WANDB_RUNNAME = os.getenv('WANDB_RUN_NAME', 'gladius_vitl_abes_gladius_data_vid_2bs')
+WANDB_RUNNAME = os.getenv('WANDB_RUN_NAME', 'gladius_vitl_abes_track_queries')
 
 img_norm_cfg = dict(
     mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
