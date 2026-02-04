@@ -129,3 +129,5 @@ vitl_abes_ds
 vitl_cashel_ds
 wandb
 police_chase.mp4
+codetr-chkpt.pt
+.agent
