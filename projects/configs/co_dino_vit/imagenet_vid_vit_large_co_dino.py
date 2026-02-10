@@ -99,7 +99,7 @@ model = dict(
 # 4) Datasets
 # -------------------------
 data = dict(
-    samples_per_gpu=2,       # ViT-L is chunky. Start at 1.
+    samples_per_gpu=4,       # ViT-L is chunky. Start at 1.
     workers_per_gpu=4,
     train=dict(
         type='CocoDataset',
@@ -171,6 +171,14 @@ log_config = dict(
 # -------------------------
 # 8) Eval / checkpoints / work_dir
 # -------------------------
-evaluation = dict(interval=1, metric='bbox', save_best='bbox_mAP', classwise=True)
+# -------------------------
+# 8) Eval / checkpoints / work_dir
+# -------------------------
+evaluation = dict(interval=4, metric='bbox', save_best='bbox_mAP', classwise=True)
 checkpoint_config = dict(interval=1, save_last=True, max_keep_ckpts=2)
 work_dir = './work_dirs/imagenet_vid_vitl'
+
+# -------------------------
+# 9) Mixed Precision
+# -------------------------
+fp16 = dict(loss_scale=512.)
