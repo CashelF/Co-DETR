@@ -153,6 +153,15 @@ class HybridMosaicDataset:
             gt_bboxes = gt_bboxes[keep_mask]
             gt_labels = gt_labels[keep_mask]
             
+            # Use Intersection (Clipped) Coords
+            xx1 = xx1[keep_mask]
+            yy1 = yy1[keep_mask]
+            xx2 = xx2[keep_mask]
+            yy2 = yy2[keep_mask]
+            
+            # Stack into new bboxes
+            gt_bboxes = np.stack([xx1, yy1, xx2, yy2], axis=1)
+
             # Transform boxes to patch coordinates
             gt_bboxes[:, [0, 2]] -= patch[0]
             gt_bboxes[:, [1, 3]] -= patch[1]
