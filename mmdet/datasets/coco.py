@@ -72,7 +72,14 @@ class CocoDataset(CustomDataset):
         self.coco = COCO(ann_file)
         # The order of returned `cat_ids` will not
         # change with the order of the CLASSES
-        self.cat_ids = self.coco.get_cat_ids(cat_names=self.CLASSES)
+        # Ensure cat_ids aligns with self.CLASSES strictly
+        self.cat_ids = []
+        for name in self.CLASSES:
+            ids = self.coco.get_cat_ids(cat_names=[name])
+            if ids:
+                self.cat_ids.append(ids[0])
+            else:
+                self.cat_ids.append(-1)
 
         self.cat2label = {cat_id: i for i, cat_id in enumerate(self.cat_ids)}
         self.img_ids = self.coco.get_img_ids()
@@ -126,6 +133,8 @@ class CocoDataset(CustomDataset):
         # obtain images that contain annotations of the required categories
         ids_in_cat = set()
         for i, class_id in enumerate(self.cat_ids):
+            if class_id == -1:
+                continue
             ids_in_cat |= set(self.coco.cat_img_map[class_id])
         # merge the image id sets of the two conditions and use the merged set
         # to filter out images if self.filter_empty_gt=True
@@ -481,7 +490,9 @@ class CocoDataset(CustomDataset):
                 break
 
             cocoEval = COCOeval(coco_gt, coco_det, iou_type)
-            cocoEval.params.catIds = self.cat_ids
+            # Filter out -1 (missing classes) for cocoEval
+            valid_cat_ids = [c for c in self.cat_ids if c != -1]
+            cocoEval.params.catIds = valid_cat_ids
             cocoEval.params.imgIds = self.img_ids
             cocoEval.params.maxDets = list(proposal_nums)
             cocoEval.params.iouThrs = iou_thrs
@@ -542,14 +553,24 @@ class CocoDataset(CustomDataset):
                     # from https://github.com/facebookresearch/detectron2/
                     precisions = cocoEval.eval['precision']
                     # precision: (iou, recall, cls, area range, max dets)
-                    assert len(self.cat_ids) == precisions.shape[2]
+                    # Note: precisions shape[2] corresponds to len(valid_cat_ids)
+                    
+                    valid_cat_ids = [c for c in self.cat_ids if c != -1]
+                    valid_cat_indices = {cid: i for i, cid in enumerate(valid_cat_ids)}
 
                     results_per_category = []
                     for idx, catId in enumerate(self.cat_ids):
+                        if catId == -1:
+                            results_per_category.append((f'{self.CLASSES[idx]}', 'nan'))
+                            continue
+
+                        # Map original catId to index in cocoEval precisions
+                        k_idx = valid_cat_indices[catId]
+                        
                         # area range index 0: all area ranges
                         # max dets index -1: typically 100 per image
                         nm = self.coco.loadCats(catId)[0]
-                        precision = precisions[:, :, idx, 0, -1]
+                        precision = precisions[:, :, k_idx, 0, -1]
                         precision = precision[precision > -1]
                         if precision.size:
                             ap = np.mean(precision)
@@ -636,7 +657,15 @@ class CocoDataset(CustomDataset):
                 raise KeyError(f'metric {metric} is not supported')
 
         coco_gt = self.coco
-        self.cat_ids = coco_gt.get_cat_ids(cat_names=self.CLASSES)
+        coco_gt = self.coco
+        # Align cat_ids with classes, inserting -1 for missing
+        self.cat_ids = []
+        for name in self.CLASSES:
+            ids = coco_gt.get_cat_ids(cat_names=[name])
+            if ids:
+                self.cat_ids.append(ids[0])
+            else:
+                self.cat_ids.append(-1)
 
         result_files, tmp_dir = self.format_results(results, jsonfile_prefix)
         eval_results = self.evaluate_det_segm(results, result_files, coco_gt,
