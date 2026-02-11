@@ -7,3 +7,4 @@ from .transformer import *
 from .query_denoising import build_dn_generator
 from .swin_transformer import *
 from .norm import *
+from .sahi_co_detr import *

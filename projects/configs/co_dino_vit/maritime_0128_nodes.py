@@ -264,9 +264,11 @@ runner = dict(type='EpochBasedRunner', max_epochs=10)
 load_from = 'checkpoints/co_dino_5scale_vit_large_coco.pth'
 
 # Logging
+RUN_NAME = 'codetr-large-maritime-0128-nodes'
+
 WANDB_PROJECT = 'co-detr-hydra'
 WANDB_ENTITY  = 'cashel'
-WANDB_RUNNAME = 'codetr-large-maritime-0128-nodes'
+WANDB_RUNNAME = RUN_NAME
 
 log_config = dict(
     interval=50,
@@ -287,7 +289,7 @@ log_config = dict(
 )
 
 # Output dir
-work_dir = '/data/cashel-data/models/codetr/maritime/maritime-0128-nodes'
+work_dir = '/data/cashel-data/models/codetr/maritime/' + RUN_NAME
 
 # Eval
 evaluation = dict(interval=1, metric='bbox', save_best='bbox_mAP', classwise=True)
