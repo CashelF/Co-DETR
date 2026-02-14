@@ -3,172 +3,200 @@ import torch.nn.functional as F
 import numpy as np
 from mmdet.models.builder import DETECTORS
 from .co_detr import CoDETR
-from mmdet.core import bbox_overlaps
-from mmcv.ops import nms
+from mmcv.ops import batched_nms
 
 @DETECTORS.register_module()
 class SahiCoDETR(CoDETR):
-    """Co-DETR wrapper for Scale-Adaptive SAHI Inference.
-    
-    Args:
-        sahi_cfg (dict): Configuration for SAHI inference.
-            Expected keys:
-            - crop_size (tuple): (h, w) of the slice. Default: (480, 480).
-            - overlap_ratio (float): Overlap ratio between slices. Default: 0.25 (unused, calculated from stride).
-            - stride (int): Stride for slicing. Default: 320.
-            - target_size (tuple): (w, h) input size for the model. Default: (1024, 1024).
-            - batch_size (int): Batch size for slice inference. Default: 4.
-            
-    """
     def __init__(self, sahi_cfg=None, **kwargs):
         super(SahiCoDETR, self).__init__(**kwargs)
         if sahi_cfg is None:
-            sahi_cfg = dict(
+            self.sahi_cfg = dict(
                 crop_size=(480, 480),
                 stride=320,
-                target_size=(1024, 1024),
-                batch_size=4
+                target_size=(1024, 1024), 
+                batch_size=4,
+                global_score_thr=0.3, # Trust global less
+                global_area_thr=32*32 # Discard global preds smaller than feature stride
             )
         self.sahi_cfg = sahi_cfg
 
     def simple_test(self, img, img_metas, proposals=None, rescale=False):
-        """Override simple_test to implement Two-Pass SAHI Inference."""
+        """Two-Pass SAHI Inference with Batching and Scale-Aware Merging."""
         
-        # img is Tensor (1, C, H, W)
-        # img_metas is list[dict]
-        
-        # Check if single image
-        if isinstance(img, list):
-             img = img[0]
-             
-        assert len(img) == 1, "SahiCoDETR only supports batch_size=1 (per device) for now"
+        if isinstance(img, list): img = img[0]
+        assert len(img) == 1, "SahiCoDETR only supports batch_size=1 per GPU"
              
         device = img.device
         h, w = img.shape[-2:]
         target_w, target_h = self.sahi_cfg['target_size']
+        crop_h, crop_w = self.sahi_cfg['crop_size']
         
-        # --- PASS 1: Global Context ---
-        # Resize full image to target_size
+        # ---------------------------------------------------------
+        # PASS 1: Global Context (The "Big Ship" Detector)
+        # ---------------------------------------------------------
         img_global = F.interpolate(img, size=(target_h, target_w), mode='bilinear', align_corners=False)
         
-        # Update img_metas for global pass
-        img_metas_global = [meta.copy() for meta in img_metas]
-        for meta in img_metas_global:
-            meta['img_shape'] = (target_h, target_w, 3)
-            ori_h, ori_w = meta['ori_shape'][:2]
-            meta['scale_factor'] = np.array([target_w / ori_w, target_h / ori_h, target_w / ori_w, target_h / ori_h], dtype=np.float32)
+        img_meta_global = img_metas[0].copy()
+        img_meta_global['img_shape'] = (target_h, target_w, 3)
+        img_meta_global['scale_factor'] = np.array(
+            [target_w / w, target_h / h, target_w / w, target_h / h], dtype=np.float32)
 
-        # Run Global Inference
-        results_global = super().simple_test(img_global, img_metas_global, proposals, rescale=True)
+        # Force rescale=True so we get coords in original (H, W) space immediately
+        results_global = super().simple_test(img_global, [img_meta_global], proposals, rescale=True)
         
-        # --- PASS 2: Slicing (Micro-Zoom) ---
-        crop_h, crop_w = self.sahi_cfg['crop_size']
+        # ---------------------------------------------------------
+        # SCALE FILTERING
+        # ---------------------------------------------------------
+        all_bboxes = []
+        all_scores = []
+        all_labels = []
+
+        # Process Global Results
+        # Global pass is BAD at small objects. Filter them out to prevent bad NMS later.
+        global_area_thr = self.sahi_cfg.get('global_area_thr', 0)
+        
+        for cls_id, boxes in enumerate(results_global[0]):
+            if len(boxes) == 0: continue
+            
+            # boxes is (N, 5) -> x1, y1, x2, y2, score
+            widths = boxes[:, 2] - boxes[:, 0]
+            heights = boxes[:, 3] - boxes[:, 1]
+            areas = widths * heights
+            
+            # KEEP only if area is large enough (trusted global detection)
+            keep_idxs = areas > global_area_thr
+            
+            if keep_idxs.any():
+                valid_boxes = torch.from_numpy(boxes[keep_idxs]).to(device)
+                all_bboxes.append(valid_boxes[:, :4])
+                all_scores.append(valid_boxes[:, 4])
+                all_labels.append(torch.full((valid_boxes.shape[0],), cls_id, device=device, dtype=torch.long))
+
+        # ---------------------------------------------------------
+        # PASS 2: Slicing
+        # ---------------------------------------------------------
         stride = self.sahi_cfg.get('stride', int(crop_h * 0.75))
         batch_size = self.sahi_cfg.get('batch_size', 4)
         
-        all_detections = [] # list of (bboxes, labels)
-        
-        # Collect global results first
-        res_global = results_global[0] 
-        for cls_idx, bboxes in enumerate(res_global):
-            if len(bboxes) > 0:
-                labels = np.full(len(bboxes), cls_idx, dtype=np.long)
-                all_detections.append((bboxes, labels))
-                
-        # Generate Step Coordinates
-        y_steps = range(0, h - crop_h + 1, stride)
-        if (h - crop_h) % stride != 0:
-            y_steps = list(y_steps) + [h - crop_h]
-            
-        x_steps = range(0, w - crop_w + 1, stride)
-        if (w - crop_w) % stride != 0:
-            x_steps = list(x_steps) + [w - crop_w]
-            
-        # Collect Slices
-        slice_tensors = []
-        slice_metas_list = []
-        slice_coords = [] # (x1, y1)
+        # 1. Prepare Slices (No inference yet)
+        slice_patches = []
+        slice_metas = []
+        slice_origins = [] # (x1, y1) offsets
+
+        y_steps = list(range(0, h - crop_h + 1, stride))
+        if (h - crop_h) % stride != 0: y_steps.append(h - crop_h)
+        x_steps = list(range(0, w - crop_w + 1, stride))
+        if (w - crop_w) % stride != 0: x_steps.append(w - crop_w)
 
         for y1 in y_steps:
             for x1 in x_steps:
-                y2 = y1 + crop_h
-                x2 = x1 + crop_w
+                # Create the patch
+                patch = img[:, :, y1:y1+crop_h, x1:x1+crop_w]
                 
-                # Crop
-                patch = img[:, :, y1:y2, x1:x2]
-                
-                # Resize to target_size (Zoom!)
+                # OPTIMIZATION: Skip completely empty water patches if possible? 
+                # (Skipping implemented here would require a quick variance check, ignored for now)
+
+                # Zoom/Upscale patch
                 patch_resized = F.interpolate(patch, size=(target_h, target_w), mode='bilinear', align_corners=False)
                 
-                # Construct Patch Metas
-                patch_meta = img_metas[0].copy()
-                patch_meta['ori_shape'] = (crop_h, crop_w, 3) 
-                patch_meta['img_shape'] = (target_h, target_w, 3)
-                patch_meta['pad_shape'] = (target_h, target_w, 3)
-                patch_meta['scale_factor'] = np.array([target_w / crop_w, target_h / crop_h, target_w / crop_w, target_h / crop_h], dtype=np.float32)
+                # Meta needed for "rescale=True" to work
+                meta = img_metas[0].copy()
+                meta['ori_shape'] = (crop_h, crop_w, 3) # Model thinks this is the "original" size
+                meta['img_shape'] = (target_h, target_w, 3)
+                meta['scale_factor'] = np.array(
+                    [target_w/crop_w, target_h/crop_h, target_w/crop_w, target_h/crop_h], dtype=np.float32)
                 
-                slice_tensors.append(patch_resized)
-                slice_metas_list.append(patch_meta)
-                slice_coords.append((x1, y1))
+                slice_patches.append(patch_resized)
+                slice_metas.append(meta)
+                slice_origins.append((x1, y1))
 
-        # Sequential Inference Loop
-        for i, patch in enumerate(slice_tensors):
-            patch_meta = slice_metas_list[i]
-            x1, y1 = slice_coords[i]
-            
-            # Run Inference on single patch
-            # Pass as list [patch] and [patch_meta] creates batch=1
-            results_patch = super().simple_test(patch, [patch_meta], proposals, rescale=True)
-            res_patch = results_patch[0]
-            
-            for cls_idx, bboxes in enumerate(res_patch):
-                if len(bboxes) > 0:
-                    # Shift boxes back to global coordinates
-                    bboxes[:, 0] += x1
-                    bboxes[:, 2] += x1
-                    bboxes[:, 1] += y1
-                    bboxes[:, 3] += y1
+        # 2. Batched Inference Loop
+        if len(slice_patches) > 0:
+            for i in range(0, len(slice_patches), batch_size):
+                # Stack batch
+                batch_imgs = torch.cat(slice_patches[i : i+batch_size], dim=0) # (B, 3, H, W)
+                batch_metas_subset = slice_metas[i : i+batch_size]
+                batch_origins = slice_origins[i : i+batch_size]
+                
+                # Inference
+                for j, single_img in enumerate(batch_imgs):
+                    single_res = super().simple_test(single_img.unsqueeze(0), [batch_metas_subset[j]], proposals, rescale=True)
                     
-                    labels = np.full(len(bboxes), cls_idx, dtype=np.long)
-                    all_detections.append((bboxes, labels))
+                    origin_x, origin_y = batch_origins[j]
+                    
+                    for cls_id, boxes in enumerate(single_res[0]):
+                        if len(boxes) == 0: continue
+                        
+                        # Boxes are already scaled to (crop_h, crop_w) because of rescale=True
+                        # We just need to shift them
+                        valid_boxes = torch.from_numpy(boxes).to(device)
+                        
+                        valid_boxes[:, 0] += origin_x
+                        valid_boxes[:, 2] += origin_x
+                        valid_boxes[:, 1] += origin_y
+                        valid_boxes[:, 3] += origin_y
+                        
+                        all_bboxes.append(valid_boxes[:, :4])
+                        all_scores.append(valid_boxes[:, 4])
+                        all_labels.append(torch.full((valid_boxes.shape[0],), cls_id, device=device, dtype=torch.long))
 
-        # --- MERGE ---
-        if not all_detections:
+        # ---------------------------------------------------------
+        # MERGE & NMS
+        # ---------------------------------------------------------
+        if not all_bboxes:
             return results_global
-            
-        final_results = [np.empty((0, 5), dtype=np.float32) for _ in range(len(res_global))]
-        
-        # Flatten all detections into a single list per class
-        detections_per_class = [[] for _ in range(len(res_global))]
-        
-        for bboxes, labels in all_detections:
-            for i in range(len(bboxes)):
-                cls_id = labels[i]
-                detections_per_class[cls_id].append(bboxes[i])
-                
-        # NMS Config
-        iou_thr = 0.5
-        nms_cfg = None
-        if isinstance(self.test_cfg, list):
-            for cfg in self.test_cfg:
-                if 'nms' in cfg:
-                    nms_cfg = cfg['nms']
-                    break
-        elif isinstance(self.test_cfg, dict):
-            nms_cfg = self.test_cfg.get('nms')
-            
-        if nms_cfg is not None:
-            iou_thr = nms_cfg.get('iou_threshold', 0.5)
 
-        # Apply NMS
-        for cls_idx, dets in enumerate(detections_per_class):
-            if len(dets) == 0:
-                continue
-            dets = np.array(dets, dtype=np.float32)
+        # Cat everything
+        merged_bboxes = torch.cat(all_bboxes)
+        merged_scores = torch.cat(all_scores)
+        merged_labels = torch.cat(all_labels)
+
+        # --- FIX: Robust NMS Config Extraction ---
+        # Default NMS config
+        nms_cfg = dict(type='nms', iou_threshold=0.5)
+        
+        # Check if test_cfg exists and handle Dict vs List
+        if self.test_cfg is not None:
+            if isinstance(self.test_cfg, dict):
+                # Scenario A: It's a simple dict
+                if 'nms' in self.test_cfg:
+                    nms_cfg = self.test_cfg['nms']
+                elif 'rcnn' in self.test_cfg and 'nms' in self.test_cfg['rcnn']:
+                    # Scenario B: Nested inside 'rcnn'
+                    nms_cfg = self.test_cfg['rcnn']['nms']
             
-            dets_tensor = torch.from_numpy(dets).to(device)
-            keep_inds = nms(dets_tensor[:, :4].contiguous(), dets_tensor[:, 4].contiguous(), iou_thr)[1]
+            elif isinstance(self.test_cfg, list):
+                # Scenario C: It's a list
+                for c in self.test_cfg:
+                    if isinstance(c, dict):
+                        if 'nms' in c:
+                            nms_cfg = c['nms']
+                            break
+                        if 'rcnn' in c and 'nms' in c['rcnn']:
+                            nms_cfg = c['rcnn']['nms']
+                            break
+
+        # Safety check: batched_nms requires a 'type'
+        if 'type' not in nms_cfg:
+            nms_cfg['type'] = 'nms'
+
+        # Batched NMS (GPU accelerated, handles classes properly)
+        dets, keep_indices = batched_nms(
+            merged_bboxes, 
+            merged_scores, 
+            merged_labels, 
+            nms_cfg
+        )
+        
+        # Convert back to standard list[np.array] format for MMDetection
+        final_results = [np.empty((0, 5), dtype=np.float32) for _ in range(len(results_global[0]))]
+        
+        if len(dets) > 0:
+            dets = dets.cpu().numpy()
+            labels = merged_labels[keep_indices].cpu().numpy()
             
-            final_results[cls_idx] = dets[keep_inds.cpu().numpy()]
+            for i in range(len(dets)):
+                cls_id = labels[i]
+                final_results[cls_id] = np.vstack([final_results[cls_id], dets[i]])
             
         return [final_results]
