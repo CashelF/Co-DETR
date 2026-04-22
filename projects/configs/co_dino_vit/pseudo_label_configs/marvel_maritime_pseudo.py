@@ -1,4 +1,4 @@
-_base_ = './maritime_0128_nodes.py'
+_base_ = '../maritime_0128_nodes.py'
 
 data_root = '/data/cashel-data/marvel-maritime-images'
 

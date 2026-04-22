@@ -1,4 +1,4 @@
-_base_ = './maritime_0128_nodes.py'
+_base_ = '../maritime_0128_nodes.py'
 
 # 1. Modify the test dataset to point to the training dataset
 # We use the training images and the training annotations but processed
